@@ -1,0 +1,852 @@
+#!/usr/bin/env python3
+"""agent-dispatch — tiny local multi-agent bus. Python 3.8+, stdlib only.
+
+Queue a task for any installed coding-agent CLI, run it unattended, and
+collect its stdout into a result file. Filesystem queues are the source of
+truth:
+
+    ~/.agent-bus/inbox/      queued tasks
+    ~/.agent-bus/running/    claimed tasks
+    ~/.agent-bus/done/       results (task JSON; result text in .md / custom path)
+    ~/.agent-bus/failed/     failures with notes
+    ~/.agent-bus/logs/       full transcripts
+    ~/.agent-bus/worktrees/  for write tasks that want isolation (convention)
+
+Optional config at ~/.agent-bus/config.json (created by install.sh):
+
+    {"default_models": {"codex": "gpt-5.6-luna"}, "disabled": ["grok"]}
+"""
+import argparse
+import datetime as dt
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import Optional
+
+HOME = Path.home()
+BUS = HOME / ".agent-bus"
+CONFIG_PATH = BUS / "config.json"
+INBOX = BUS / "inbox"
+RUNNING = BUS / "running"
+DONE = BUS / "done"
+FAILED = BUS / "failed"
+LOGS = BUS / "logs"
+WORKTREES = BUS / "worktrees"
+
+MAX_RESULT_BYTES = int(os.environ.get("AGENT_BUS_MAX_RESULT_BYTES", "2000000"))
+
+AGENT_COMMANDS = {
+    "cursor": ["cursor-agent", "--print", "--output-format", "text",
+               "--trust", "--force", "--sandbox", "disabled"],
+    "antigravity": ["agy", "--dangerously-skip-permissions", "-p"],
+    "codex": ["codex", "exec", "--dangerously-bypass-approvals-and-sandbox",
+              "-s", "danger-full-access"],
+    "claude": ["claude", "-p", "--dangerously-skip-permissions"],
+    "grok": ["grok", "--output-format", "plain", "--always-approve"],
+    "copilot": ["copilot", "--allow-all-tools", "--no-ask-user",
+                "--no-remote-export", "--log-level", "none",
+                "--max-ai-credits", "30"],
+    # --format json streams JSONL events; the dispatcher extracts the
+    # assistant text parts (see _extract_opencode_text). --auto approves
+    # permissions, matching the unattended flags of the other lanes.
+    "opencode": ["opencode", "run", "--format", "json", "--auto"],
+}
+
+DEFAULT_MODELS = {
+    "cursor": "composer-2.5",
+    "antigravity": "Gemini 3.6 Flash (High)",
+    "codex": "gpt-5.6-sol",
+    "claude": "sonnet",
+    "grok": "grok-4.5",
+    "copilot": "auto",
+    "opencode": "",
+}
+
+DEFAULT_EFFORT = {
+    "codex": "medium",
+    "grok": "high",
+}
+
+ROUTES = {
+    "auto": ["antigravity", "cursor", "opencode"],
+    "cheap": ["antigravity", "cursor", "opencode"],
+    "pm": ["codex", "claude"],
+}
+
+EXTRA_PATHS = [
+    "/opt/homebrew/bin",
+    "/opt/homebrew/sbin",
+    "/usr/local/bin",
+    "/usr/local/sbin",
+    str(HOME / ".local" / "bin"),
+]
+
+TRANSIENT_MARKERS = [
+    "AbortError", "RESOURCE_EXHAUSTED", "rate limit", "rate-limit",
+    "ratelimit", "Too Many Requests", " 429", " 502 ", " 503 ", " 504 ",
+    "Bad Gateway", "Service Unavailable", "Gateway Timeout",
+    "Internal Server Error", "ECONNRESET", "ECONNREFUSED", "ETIMEDOUT",
+    "socket hang up", "stream timeout", "fetch failed",
+    "MODEL_CAPACITY_EXHAUSTED", "No capacity available",
+]
+
+
+def load_config() -> dict:
+    try:
+        return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def default_model(agent: str) -> str:
+    cfg = load_config()
+    override = (cfg.get("default_models") or {}).get(agent)
+    if override is not None:
+        return override
+    return DEFAULT_MODELS.get(agent, "")
+
+
+def is_disabled(agent: str) -> bool:
+    return agent in (load_config().get("disabled") or [])
+
+
+def executable_missing(agent: str) -> bool:
+    exe = AGENT_COMMANDS[agent][0]
+    return shutil.which(exe) is None
+
+
+def ensure_bus() -> None:
+    for path in [INBOX, RUNNING, DONE, FAILED, LOGS, WORKTREES]:
+        path.mkdir(parents=True, exist_ok=True)
+
+
+def slugify(text: str) -> str:
+    text = re.sub(r"[^a-zA-Z0-9]+", "-", text.strip().lower()).strip("-")
+    return text[:48] or "task"
+
+
+def now_id(label: str) -> str:
+    stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+    return f"{stamp}-{slugify(label)}"
+
+
+def load_task(path: Path) -> dict:
+    with path.open("r", encoding="utf-8") as f:
+        if path.suffix == ".json":
+            return json.load(f)
+        body = f.read()
+    return {"id": path.stem, "to": "auto", "mode": "read-only",
+            "cwd": str(HOME), "prompt": body, "scope": "unspecified"}
+
+
+def write_task(task: dict, directory: Path = INBOX) -> Path:
+    ensure_bus()
+    path = directory / f"{task['id']}.json"
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(task, f, indent=2)
+        f.write("\n")
+    return path
+
+
+def task_prompt(task: dict) -> str:
+    cwd = task.get("cwd", str(HOME))
+    mode = task.get("mode", "read-only")
+    scope = task.get("scope", "unspecified")
+    result = task.get("result", str(DONE / f"{task['id']}.md"))
+    agents_md = read_optional(HOME / "AGENTS.md")
+    if agents_md:
+        context = (f"--- BEGIN ~/AGENTS.md ---\n{agents_md}\n--- END ~/AGENTS.md ---")
+    else:
+        context = ("(No ~/AGENTS.md found. General policy: stay in scope, "
+                   "don't exfiltrate secrets, prefer minimal diffs.)")
+
+    return f"""You are a delegated worker agent running through a local agent bus.
+A lead agent will review your output, so be concrete and self-contained.
+
+Task id: {task['id']}
+Mode: {mode}
+Working directory: {cwd}
+Scope: {scope}
+Expected result file: {result} (do NOT write it yourself — the dispatcher
+captures your stdout and writes that file after you exit)
+
+Rules:
+- If mode is read-only, do not edit files.
+- If mode is write, keep edits within scope and summarize changed files.
+- Do not include secrets, tokens, passwords, or private keys in your output.
+- End with a concise result, risks, and recommended next step.
+
+House rules from the human who set up this machine:
+{context}
+
+Task:
+{task.get('prompt', '')}
+"""
+
+
+def read_optional(path: Path, limit: int = 20000) -> str:
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    if len(text) > limit:
+        return text[:limit] + "\n... [truncated by agent-dispatch] ..."
+    return text
+
+
+def worker_env() -> dict:
+    env = dict(os.environ)
+    current = env.get("PATH", "")
+    parts = [part for part in current.split(os.pathsep) if part]
+    for path in reversed(EXTRA_PATHS):
+        if path not in parts:
+            parts.insert(0, path)
+    env["PATH"] = os.pathsep.join(parts)
+    # Best-effort: macOS keychain-stored Cursor API key for unattended runs.
+    # Silently skipped on other platforms or when absent.
+    if "CURSOR_API_KEY" not in env and sys.platform == "darwin":
+        try:
+            key = subprocess.run(
+                ["security", "find-generic-password",
+                 "-s", "CURSOR_API_KEY", "-w"],
+                capture_output=True, text=True, timeout=10,
+            ).stdout.strip()
+            if key:
+                env["CURSOR_API_KEY"] = key
+        except (OSError, subprocess.SubprocessError):
+            pass
+    return env
+
+
+def claim(path: Path) -> Path:
+    running_path = RUNNING / path.name
+    path.rename(running_path)
+    return running_path
+
+
+def finish(task_path: Path, target_dir: Path, note: Optional[str] = None) -> Path:
+    target = target_dir / task_path.name
+    task_path.rename(target)
+    if note:
+        note_path = target_dir / f"{target.stem}.note.txt"
+        note_path.write_text(note, encoding="utf-8")
+    return target
+
+
+def task_target(task: dict) -> str:
+    return task.get("to") or "auto"
+
+
+def is_transient_failure(output: str, returncode: int) -> bool:
+    if returncode == 0:
+        return False
+    return any(marker in output for marker in TRANSIENT_MARKERS)
+
+
+def cap_output(output: str, limit: int = None) -> str:
+    limit = MAX_RESULT_BYTES if limit is None else limit
+    if limit <= 0 or len(output) <= limit:
+        return output
+    head = limit // 4
+    tail = limit - head
+    dropped = len(output) - limit
+    return (
+        output[:head]
+        + f"\n\n[dispatcher] --- TRUNCATED: dropped {dropped:,} of {len(output):,} "
+          f"characters (cap {limit:,}). Full transcript in the log file. "
+          f"Raise with AGENT_BUS_MAX_RESULT_BYTES. ---\n\n"
+        + output[-tail:]
+    )
+
+
+def write_result_file(result_path: Path, task: dict, agent: str,
+                      log_path: Path, output: str, cwd: Path) -> None:
+    if agent == "opencode":
+        output = _extract_opencode_text(output) or output
+    if task.get("wrap_result"):
+        result_path.write_text(
+            f"# Agent Result: {task['id']}\n\n"
+            f"- Agent: `{agent}`\n"
+            f"- Mode: `{task.get('mode', 'read-only')}`\n"
+            f"- CWD: `{cwd}`\n"
+            f"- Log: `{log_path}`\n\n"
+            "## Output\n\n"
+            f"```text\n{output[-60000:]}\n```\n",
+            encoding="utf-8",
+        )
+    else:
+        result_path.write_text(cap_output(output), encoding="utf-8")
+
+
+def _extract_opencode_text(raw: str) -> str:
+    """Pull assistant text out of `opencode run --format json` JSONL output."""
+    texts = []
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if event.get("type") == "text":
+            part = event.get("part") or {}
+            if isinstance(part.get("text"), str):
+                texts.append(part["text"])
+    return "".join(texts)
+
+
+def build_worker_cmd(agent: str, task: dict, prompt: str) -> list:
+    cmd = list(AGENT_COMMANDS[agent])
+    model = task.get("model") or default_model(agent)
+    if agent == "antigravity":
+        cmd = ["agy", "--dangerously-skip-permissions",
+               "--add-dir", task.get("cwd") or str(HOME)]
+        if model:
+            cmd += ["--model", model]
+        cmd += ["--print-timeout", f"{int(task.get('timeout') or 3600)}s"]
+        cmd += ["-p"]
+    if agent == "cursor" and model:
+        cmd += ["--model", model]
+    if agent == "claude" and model:
+        cmd += ["--model", model]
+    effort = task.get("effort") or DEFAULT_EFFORT.get(agent)
+    if agent == "claude" and effort:
+        cmd += ["--effort", effort]
+    if agent == "codex":
+        if model:
+            cmd += ["-m", model]
+        if effort:
+            cmd += ["-c", f"model_reasoning_effort={effort}"]
+        if task.get("cwd"):
+            cmd += ["-C", task["cwd"]]
+    if agent == "grok":
+        if model:
+            cmd += ["-m", model]
+        if effort:
+            cmd += ["--reasoning-effort", effort]
+        cmd += ["--single"]
+    if agent == "copilot":
+        if model and model != "auto":
+            cmd += ["--model", model]
+        cmd += ["-p"]
+    if agent == "opencode":
+        if model:
+            cmd += ["--model", model]
+        if task.get("effort"):
+            cmd += ["--variant", task["effort"]]
+        if task.get("cwd"):
+            cmd += ["--dir", task["cwd"]]
+    cmd += [prompt]
+    return cmd
+
+
+def invoke_once(cmd: list, cwd: Path, timeout_seconds: int, log) -> tuple:
+    display_cmd = [*cmd[:-1], "<prompt>"]
+    log.write(f"$ {' '.join(display_cmd)}\ncwd={cwd}\n\n")
+    log.flush()
+    try:
+        proc = subprocess.run(
+            cmd, cwd=str(cwd), env=worker_env(), text=True,
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, timeout=timeout_seconds,
+        )
+        output = proc.stdout or ""
+        returncode = proc.returncode
+        if returncode == 0 and not output.strip():
+            returncode = 3
+            output += ("\n[dispatcher] empty_output: worker exited 0 with no "
+                       "output (treated as failure)\n")
+        log.write(output)
+        log.flush()
+        return output, returncode
+    except subprocess.TimeoutExpired as exc:
+        raw = exc.stdout or b""
+        output = (raw.decode("utf-8", errors="replace")
+                  if isinstance(raw, bytes) else (raw or ""))
+        log.write(output)
+        log.write(f"\n[dispatcher] TimeoutExpired after {timeout_seconds}s\n")
+        log.flush()
+        return output, 124
+
+
+def run_task(path: Path) -> int:
+    ensure_bus()
+    running_path = claim(path)
+    task = load_task(running_path)
+    task["pid"] = os.getpid()
+    task["started_at"] = time.time()
+    with running_path.open("w", encoding="utf-8") as _f:
+        json.dump(task, _f, indent=2)
+        _f.write("\n")
+    agent = task_target(task)
+
+    cwd = Path(task.get("cwd", str(HOME))).expanduser()
+    result_path = Path(task.get("result",
+                               str(DONE / f"{task['id']}.md"))).expanduser()
+    result_path.parent.mkdir(parents=True, exist_ok=True)
+    log_path = LOGS / f"{task['id']}.log"
+
+    if agent in ROUTES:
+        return run_route(running_path, task, agent)
+
+    if agent not in AGENT_COMMANDS:
+        finish(running_path, FAILED, f"Unknown agent: {agent}")
+        return 2
+    if is_disabled(agent):
+        finish(running_path, FAILED, f"Worker disabled in config: {agent}")
+        return 2
+    if executable_missing(agent):
+        finish(running_path, FAILED,
+               f"Missing executable: {AGENT_COMMANDS[agent][0]} "
+               f"(is that worker CLI installed and logged in?)")
+        return 127
+
+    prompt = task_prompt(task)
+    cmd = build_worker_cmd(agent, task, prompt)
+    timeout_seconds = int(task.get("timeout_seconds", 3600))
+    max_retries = int(task.get("retry", 2))
+
+    output = ""
+    returncode = 1
+
+    with log_path.open("w", encoding="utf-8") as log:
+        for attempt in range(max_retries + 1):
+            if attempt > 0:
+                backoff = [5, 20, 60][min(attempt - 1, 2)]
+                log.write(f"\n--- transient failure on attempt {attempt}; "
+                          f"retrying in {backoff}s "
+                          f"(retry {attempt}/{max_retries}) ---\n\n")
+                log.flush()
+                time.sleep(backoff)
+            display_cmd = [*cmd[:-1], "<prompt>"]
+            log.write(f"$ {' '.join(display_cmd)}\ncwd={cwd}\n\n")
+            log.flush()
+            try:
+                proc = subprocess.Popen(
+                    cmd, cwd=str(cwd), env=worker_env(), text=True,
+                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT, bufsize=1,
+                )
+                output_lines = []
+                deadline = time.time() + timeout_seconds
+                timed_out = False
+                for raw_line in proc.stdout:
+                    output_lines.append(raw_line)
+                    log.write(raw_line)
+                    log.flush()
+                    if time.time() >= deadline:
+                        proc.kill()
+                        timed_out = True
+                        break
+                proc.wait()
+                output = "".join(output_lines)
+                if timed_out:
+                    log.write(f"\n[dispatcher] TimeoutExpired "
+                              f"after {timeout_seconds}s\n")
+                    log.flush()
+                    write_result_file(result_path, task, agent,
+                                      log_path, output, cwd)
+                    finish(running_path, FAILED, "Task timed out.")
+                    return 124
+                returncode = proc.returncode
+                if returncode == 0 and not output.strip():
+                    returncode = 3
+                    output += ("\n[dispatcher] empty_output: worker exited 0 "
+                               "with no output (treated as failure)\n")
+            except OSError as exc:
+                output = f"[dispatcher] OSError: {exc}\n"
+                log.write(output)
+                log.flush()
+                returncode = 1
+
+            if returncode == 0:
+                break
+            if (not is_transient_failure(output, returncode)
+                    or attempt == max_retries):
+                break
+
+    # Cursor resilience: once included usage is exhausted, only Auto mode
+    # keeps serving. Retry quota-failed non-Auto runs once with Auto.
+    used_model = task.get("model") or default_model("cursor")
+    if (returncode != 0 and agent == "cursor"
+            and used_model != "auto"
+            and quota_like_failure(output)):
+        with log_path.open("a", encoding="utf-8") as log:
+            log.write(f"\n--- cursor usage exhausted on `{used_model}`; "
+                      "retrying once with Auto mode ---\n\n")
+            log.flush()
+            auto_task = dict(task)
+            auto_task["model"] = "auto"
+            auto_cmd = build_worker_cmd("cursor", auto_task, prompt)
+            output, returncode = invoke_once(auto_cmd, cwd,
+                                             timeout_seconds, log)
+
+    write_result_file(result_path, task, agent, log_path, output, cwd)
+
+    if returncode == 0:
+        finish(running_path, DONE)
+    else:
+        finish(running_path, FAILED, f"Exit code: {returncode}")
+    return returncode
+
+
+def quota_like_failure(output: str) -> bool:
+    markers = [
+        "quota", "rate limit", "rate-limit", "limit reached", "usage limit",
+        "resource exhausted", "too many requests", "insufficient credits",
+        "payment required", "unauthorized", "not authenticated",
+        "authentication", "permission denied", "workspace trust required",
+        "empty_output", "out of usage", "increase your limit",
+        "switch to auto", "actionrequirederror",
+    ]
+    lower = output.lower()
+    return any(marker in lower for marker in markers)
+
+
+def run_route(running_path: Path, task: dict, route: str) -> int:
+    chain = ROUTES[route]
+    attempts = []
+    final_rc = 1
+
+    for agent in chain:
+        if is_disabled(agent) or executable_missing(agent):
+            attempts.append((agent, "skipped",
+                             "worker not installed/disabled", ""))
+            continue
+        attempt = dict(task)
+        attempt["to"] = agent
+        attempt["id"] = f"{task['id']}--{agent}"
+        attempt["result"] = str(DONE / f"{attempt['id']}.md")
+        attempt["wrap_result"] = False
+        attempt_path = write_task(attempt, RUNNING)
+        rc = run_task(attempt_path)
+        log_path = LOGS / f"{attempt['id']}.log"
+        output = read_optional(log_path, limit=60000)
+        attempts.append((agent, rc, log_path, attempt["result"]))
+        final_rc = rc
+        if rc == 0:
+            primary_result_path = Path(task.get(
+                "result", str(DONE / f"{task['id']}.md"))).expanduser()
+            winning_output = read_optional(
+                Path(attempt["result"]).expanduser(), limit=200000)
+            if task.get("wrap_result"):
+                primary_result_path.write_text(
+                    f"# Agent Result: {task['id']}\n\n"
+                    f"- Route: `{route}`\n"
+                    f"- Winning agent: `{agent}`\n\n"
+                    "## Attempts\n\n"
+                    + "\n".join(f"- `{a}` exit `{r}` result `{res}` log `{p}`"
+                                for a, r, p, res in attempts)
+                    + "\n\n## Winning Output\n\n"
+                    f"{winning_output}\n",
+                    encoding="utf-8",
+                )
+            else:
+                primary_result_path.write_text(winning_output,
+                                               encoding="utf-8")
+            finish(running_path, DONE)
+            print(f"done: {primary_result_path}")
+            print(f"winning-result: {attempt['result']}")
+            return 0
+        if not quota_like_failure(output):
+            break
+
+    note = "Fallback attempts failed:\n" + "\n".join(
+        f"- {a}: exit {r}, result {res}, log {p}" for a, r, p, res in attempts
+    )
+    finish(running_path, FAILED, note)
+    return final_rc
+
+
+def cmd_submit(args: argparse.Namespace) -> int:
+    ensure_bus()
+    if args.prompt_file:
+        prompt_path = Path(args.prompt_file).expanduser()
+        if not prompt_path.exists():
+            print(f"Prompt file not found: {prompt_path}", file=sys.stderr)
+            return 2
+        prompt = prompt_path.read_text(encoding="utf-8").strip()
+    else:
+        prompt = " ".join(args.prompt).strip()
+        if not prompt:
+            prompt = sys.stdin.read().strip()
+    if not prompt:
+        print("No prompt provided.", file=sys.stderr)
+        return 2
+
+    task_id = args.id or now_id(prompt)
+    result = args.result or str(DONE / f"{task_id}.md")
+    task = {
+        "id": task_id,
+        "to": args.to,
+        "mode": args.mode,
+        "cwd": str(Path(args.cwd).expanduser()),
+        "prompt": prompt,
+        "scope": args.scope,
+        "result": result,
+        "timeout_seconds": args.timeout,
+        "retry": args.retry,
+    }
+    if args.model:
+        task["model"] = args.model
+    if args.effort:
+        task["effort"] = args.effort
+    if args.wrap_result:
+        task["wrap_result"] = True
+    path = write_task(task)
+    print(path)
+    if args.run:
+        rc = run_task(path)
+        result_path = Path(result).expanduser()
+        if result_path.exists():
+            print(f"result: {result_path}")
+        return rc
+    return 0
+
+
+def cmd_run(args: argparse.Namespace) -> int:
+    ensure_bus()
+    tasks = sorted(INBOX.glob("*.json"))
+    if args.id:
+        tasks = [p for p in tasks if p.stem == args.id or p.name == args.id]
+    if not tasks:
+        print("No queued tasks.")
+        return 0
+    rc = 0
+    for path in tasks[: args.limit]:
+        rc = run_task(path)
+        if rc != 0 and args.stop_on_fail:
+            return rc
+    return rc
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    ensure_bus()
+    for label, directory in [("inbox", INBOX), ("running", RUNNING),
+                             ("done", DONE), ("failed", FAILED)]:
+        if args.prefix:
+            count = sum(1 for p in directory.glob("*.json")
+                        if p.stem.startswith(args.prefix))
+        else:
+            count = len(list(directory.glob("*.json")))
+        print(f"{label}: {count}")
+    orphans = find_orphans(args.prefix)
+    if orphans:
+        print(f"orphaned: {len(orphans)} dead task(s) in running/ "
+              f"— run `agent-dispatch sweep`")
+        for path, _task, reason in orphans:
+            print(f"  {path.stem}: {reason}")
+    return 0
+
+
+def cmd_list(args: argparse.Namespace) -> int:
+    ensure_bus()
+    directory = {"inbox": INBOX, "running": RUNNING,
+                 "done": DONE, "failed": FAILED}[args.queue]
+    for path in sorted(directory.glob("*.json")):
+        if args.prefix and not path.stem.startswith(args.prefix):
+            continue
+        task = load_task(path)
+        print(f"{path.stem}\t{task_target(task)}\t{task.get('mode')}"
+              f"\t{task.get('cwd')}")
+    return 0
+
+
+def _pid_alive(pid) -> bool:
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except (OSError, ValueError, TypeError):
+        return False
+
+
+def _pid_is_dispatcher(pid) -> bool:
+    if not _pid_alive(pid):
+        return False
+    try:
+        out = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "command="],
+            capture_output=True, text=True, timeout=5,
+        ).stdout
+        return "agent-dispatch" in out
+    except Exception:
+        return True
+
+
+def find_orphans(prefix: Optional[str] = None) -> list:
+    orphans = []
+    for path in sorted(RUNNING.glob("*.json")):
+        if prefix and not path.stem.startswith(prefix):
+            continue
+        try:
+            task = load_task(path)
+        except Exception:
+            orphans.append((path, {"id": path.stem}, "unreadable task JSON"))
+            continue
+        pid = task.get("pid")
+        if pid:
+            if not _pid_is_dispatcher(pid):
+                orphans.append((path, task,
+                                f"dispatcher pid {pid} no longer running"))
+        else:
+            age = time.time() - path.stat().st_mtime
+            if age > 120:
+                orphans.append((path, task,
+                                f"no pid stamped and idle {int(age)}s"))
+    return orphans
+
+
+def sweep_orphans(prefix: Optional[str] = None, verbose: bool = False) -> int:
+    swept = 0
+    for path, task, reason in find_orphans(prefix):
+        note = (f"orphaned in running/ ({reason}); swept to failed/ by "
+                f"`agent-dispatch sweep`. The task never produced a result; "
+                f"re-submit if still wanted.")
+        task["failure_note"] = note
+        task["failed_at"] = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        try:
+            path.write_text(json.dumps(task, indent=2) + "\n",
+                            encoding="utf-8")
+        except Exception:
+            pass
+        finish(path, FAILED, note)
+        if verbose:
+            print(f"swept: {path.stem} ({reason})")
+        swept += 1
+    return swept
+
+
+def cmd_sweep(args: argparse.Namespace) -> int:
+    ensure_bus()
+    n = sweep_orphans(args.prefix, verbose=True)
+    print(f"swept {n} orphaned entr{'y' if n == 1 else 'ies'}"
+          if n else "no orphans")
+    return 0
+
+
+def cmd_wait(args: argparse.Namespace) -> int:
+    ensure_bus()
+    deadline = time.time() + args.timeout if args.timeout > 0 else float("inf")
+    last_count = -1
+    while True:
+        n = sweep_orphans(args.prefix, verbose=args.verbose)
+        if n and args.verbose:
+            print(f"(auto-swept {n} orphaned entr{'y' if n == 1 else 'ies'})")
+        active = []
+        for d in (INBOX, RUNNING):
+            for p in d.glob("*.json"):
+                if not args.prefix or p.stem.startswith(args.prefix):
+                    active.append((d.name, p.stem))
+        count = len(active)
+        if count == 0:
+            if args.verbose:
+                print("all clear")
+            return 0
+        if args.verbose and count != last_count:
+            label = f"prefix={args.prefix} " if args.prefix else ""
+            print(f"waiting on {count} task(s) {label}"
+                  f"({sum(1 for d, _ in active if d == 'inbox')} queued, "
+                  f"{sum(1 for d, _ in active if d == 'running')} running)")
+            last_count = count
+        if time.time() >= deadline:
+            print(f"timeout: {count} task(s) still active", file=sys.stderr)
+            for d, stem in active:
+                print(f"  {d}/{stem}", file=sys.stderr)
+            return 124
+        time.sleep(args.poll)
+
+
+def cmd_workers(_args: argparse.Namespace) -> int:
+    """Show which worker CLIs are installed and usable. For setup checks."""
+    for name in sorted(AGENT_COMMANDS):
+        if is_disabled(name):
+            print(f"{name:<12} disabled in config")
+        elif executable_missing(name):
+            print(f"{name:<12} NOT INSTALLED ({AGENT_COMMANDS[name][0]} "
+                  f"not on PATH)")
+        else:
+            print(f"{name:<12} ready (default model: "
+                  f"{default_model(name) or '(worker default)'})")
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Local multi-agent bus.")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    submit = sub.add_parser("submit", help="Queue a delegated task.")
+    submit.add_argument("prompt", nargs="*",
+                        help="Task prompt. Reads stdin if --prompt-file is "
+                             "not set and no positional prompt given.")
+    submit.add_argument("--to",
+                        choices=sorted(list(AGENT_COMMANDS) + list(ROUTES)),
+                        default="auto")
+    submit.add_argument("--mode", choices=["read-only", "write"],
+                        default="read-only")
+    submit.add_argument("--cwd", default=str(Path.cwd()))
+    submit.add_argument("--scope", default="current working directory")
+    submit.add_argument("--id")
+    submit.add_argument("--result")
+    submit.add_argument("--prompt-file",
+                        help="Read the prompt from this file (avoids "
+                             "shell-quoting large/multiline prompts).")
+    submit.add_argument("--model",
+                        help="Provider/model override for the worker.")
+    submit.add_argument("--effort",
+                        help="Reasoning effort where supported "
+                             "(codex: low|medium|high|xhigh; "
+                             "opencode/claude: provider variant).")
+    submit.add_argument("--timeout", type=int, default=3600)
+    submit.add_argument("--retry", type=int, default=2,
+                        help="Max retries on transient failures (default 2).")
+    submit.add_argument("--wrap-result", action="store_true",
+                        help="Markdown-wrap the result file with metadata. "
+                             "Default is raw model output.")
+    submit.add_argument("--run", action="store_true",
+                        help="Run immediately after queueing.")
+    submit.set_defaults(func=cmd_submit)
+
+    run = sub.add_parser("run", help="Run queued tasks.")
+    run.add_argument("--id")
+    run.add_argument("--limit", type=int, default=1)
+    run.add_argument("--stop-on-fail", action="store_true")
+    run.set_defaults(func=cmd_run)
+
+    status = sub.add_parser("status", help="Show queue counts.")
+    status.add_argument("--prefix")
+    status.set_defaults(func=cmd_status)
+
+    list_cmd = sub.add_parser("list", help="List tasks in a queue.")
+    list_cmd.add_argument("queue",
+                          choices=["inbox", "running", "done", "failed"],
+                          default="inbox", nargs="?")
+    list_cmd.add_argument("--prefix")
+    list_cmd.set_defaults(func=cmd_list)
+
+    sweep = sub.add_parser("sweep", help="Move orphaned running/ tasks "
+                                        "(dead dispatcher pid) to failed/.")
+    sweep.add_argument("--prefix")
+    sweep.set_defaults(func=cmd_sweep)
+
+    wait = sub.add_parser("wait", help="Block until matching tasks finish.")
+    wait.add_argument("--prefix")
+    wait.add_argument("--timeout", type=int, default=0)
+    wait.add_argument("--poll", type=float, default=2.0)
+    wait.add_argument("--verbose", "-v", action="store_true")
+    wait.set_defaults(func=cmd_wait)
+
+    workers = sub.add_parser("workers", help="Show installed worker CLIs.")
+    workers.set_defaults(func=cmd_workers)
+
+    args = parser.parse_args()
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

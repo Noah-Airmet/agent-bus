@@ -1,0 +1,8 @@
+{
+  "_comment": "agent-bus config. Created by install.sh — edit freely, it is never overwritten.",
+  "default_models": {
+    "_comment": "Override a worker's default model, e.g. {\"codex\": \"gpt-5.6-luna\"}. Model IDs change often; run the worker's own list-models command to see current slugs.",
+    "codex": "gpt-5.6-sol"
+  },
+  "disabled": []
+}
