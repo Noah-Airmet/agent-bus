@@ -1,8 +1,12 @@
 {
   "_comment": "agent-bus config. Created by install.sh — edit freely, it is never overwritten.",
   "default_models": {
-    "_comment": "Override a worker's default model, e.g. {\"codex\": \"gpt-5.6-luna\"}. Model IDs change often; run the worker's own list-models command to see current slugs.",
-    "codex": "gpt-5.6-sol"
+    "_comment": "Override a worker's default model. Model IDs change often; use each worker's own list-models command to see current slugs. Examples that were current Sep 2026:",
+    "codex": "gpt-5.6-sol",
+    "antigravity": "Gemini 3.8 Flash (High)",
+    "cursor": "composer-2.5",
+    "claude": "sonnet",
+    "opencode": "opencode-go/gpt-5.6-luna"
   },
   "disabled": []
 }

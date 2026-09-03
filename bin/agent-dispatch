@@ -59,7 +59,9 @@ AGENT_COMMANDS = {
 
 DEFAULT_MODELS = {
     "cursor": "composer-2.5",
-    "antigravity": "Gemini 3.6 Flash (High)",
+    # agy accepts display names ("Gemini 3.8 Flash (High)") and suffixed
+    # slugs (gemini-3.8-flash-high); reasoning tier is part of the id.
+    "antigravity": "Gemini 3.8 Flash (High)",
     "codex": "gpt-5.6-sol",
     "claude": "sonnet",
     "grok": "grok-4.5",

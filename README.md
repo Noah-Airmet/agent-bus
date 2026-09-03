@@ -108,6 +108,17 @@ agent-dispatch list done
   and none of your context: goal, current state, constraints, output format.
 - Results land in `~/.agent-bus/done/<id>.md` (raw worker output, no
   wrapper). Read the file yourself; never ask the human to check it.
+
+### Recommended models (Sep 2026 — IDs churn, verify with each tool's list command)
+
+| Worker | Default | Worth knowing |
+|---|---|---|
+| antigravity | Gemini 3.8 Flash High | `-low` + caching for bulk; High for coding |
+| codex | `gpt-5.6-sol` | `gpt-5.6-luna` — best cost-per-task for long runs |
+| claude | `sonnet` | `claude-opus-5` heavy work; `claude-fable-5-1` hardest jobs |
+| cursor | `composer-2.5` | Gateway to 200+ models incl. Fable, Sol, Gemini |
+| opencode | worker default | `opencode-go/gpt-5.6-luna`, `opencode-go/muse-spark-1.3` |
+| copilot | `auto` | GitHub chores only, small monthly budget |
 - Prefer `--mode read-only` for research/audits/summaries. Write tasks need
   `--scope` and success criteria.
 - Fan-out: submit N tasks with a shared `--id` prefix (e.g. `batch-1`,
