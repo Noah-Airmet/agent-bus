@@ -24,7 +24,7 @@ your AI tools so they can delegate work to each other, then test it."*
 **Step 1 — See what AI tools are installed.** Run:
 
 ```bash
-for c in cursor-agent agy codex claude grok copilot opencode; do
+for c in cursor-agent agy codex claude copilot opencode; do
   command -v $c >/dev/null 2>&1 && echo "$c: installed" || echo "$c: missing"
 done
 ```
@@ -102,23 +102,51 @@ agent-dispatch status
 agent-dispatch list done
 ```
 
+`submit --bg` starts a detached dispatcher, prints its task ID, and appends
+dispatcher output to `logs/<id>.dispatcher.log`. `--worktree` creates a branch
+`bus/<id>` and runs in `worktrees/<id>`; the worktree is retained after the
+task. `--continuations N` controls how many times Codex or Claude may continue
+after a successful answer that has no `STATUS:` line (default 1).
+
+`AGENT_BUS_HOME` overrides the queue root for isolated runs and tests. Tasks
+can use `--timeout SECONDS` to set the worker deadline. The dispatcher kills
+the worker process group at the deadline. Foreground runs ignore SIGHUP and
+record a failed task if they receive SIGTERM or SIGINT.
+
+`agent-dispatch prune --older-than DAYS [--dry-run]` writes `.gz` copies of old
+result and log files (30 days by default); it keeps the original files and
+skips active task IDs. On task completion, an optional ntfy message is sent using
+`AGENT_BUS_NTFY_TOPIC` or the local `ntfy-topic` setting file. Messages contain
+only the task ID, outcome, worker, and elapsed time.
+
 - `--to auto` tries cheap/fast workers first and falls through on quota or
   auth failures — the right default when you don't care who does it.
 - A worker gets **one prompt**. Brief it like a colleague with your tools
   and none of your context: goal, current state, constraints, output format.
-- Results land in `~/.agent-bus/done/<id>.md` (raw worker output, no
+- Results land in `~/.agent-bus/done/<id>.md` (final worker response, no
   wrapper). Read the file yourself; never ask the human to check it.
 
-### Recommended models (late Sep 2026 — IDs churn, verify with each tool's list command)
+### Recommended models
 
 | Worker | Default | Worth knowing |
 |---|---|---|
-| antigravity | Gemini 3.8 Flash High | `-low` + caching for bulk; High for coding |
-| codex | `gpt-5.6-sol` | `gpt-6-luna` at high effort — the workhorse for scoped jobs with acceptance tests (needs Codex CLI ≥0.155) |
-| claude | `sonnet` | `claude-opus-5-5` as the planner/reviewer and for the hardest jobs |
-| cursor | `composer-2.5` | Gateway to 200+ models incl. Opus, Sol, Gemini |
-| opencode | worker default | `opencode-go/gpt-5.6-luna`, `opencode-go/muse-spark-1.3` |
-| copilot | `auto` | GitHub chores only, small monthly budget |
+| Principal / reviewer | Opus 5.5 | Planning and review |
+| Workhorse | `gpt-6-luna` at high effort | Scoped implementation and analysis |
+| Backup | Gemini 3.8 Flash | Antigravity lane |
+| Overflow | Cursor | Use when other lanes are unavailable or constrained |
+
+### Read-only behavior
+
+| Worker | Read-only behavior |
+|---|---|
+| Codex | Uses the CLI `read-only` sandbox. |
+| Claude | Uses permission mode `plan`. |
+| Antigravity | Uses mode `plan`. |
+| Cursor | The installed CLI did not expose a verified read-only mode; its existing sandbox options are retained. |
+| Copilot, opencode | No verified read-only mode is wired; existing worker behavior is retained. |
+
+Read-only mode is a CLI safeguard for the named lanes; task prompts also
+instruct workers not to edit. Routes inherit the selected worker's behavior.
 - Prefer `--mode read-only` for research/audits/summaries. Write tasks need
   `--scope` and success criteria.
 - Fan-out: submit N tasks with a shared `--id` prefix (e.g. `batch-1`,
@@ -131,7 +159,7 @@ agent-dispatch list done
 | `Missing executable` | That worker's CLI isn't installed | Use a different `--to`, or help the human install it |
 | Task fails mentioning login/auth/quota | Worker CLI not logged in, or plan quota spent | Route to another worker (`--to auto` does this itself); ask human to log in or wait for quota reset |
 | `command not found: agent-dispatch` | `~/.local/bin` not on PATH | Add `export PATH="$HOME/.local/bin:$PATH"` to `~/.zshrc`, restart terminal |
-| Task sits in `running/` forever | Dispatcher process was killed | `agent-dispatch sweep` moves it to `failed/`; re-submit |
+| Task sits in `running/` forever | An older dispatcher process was killed | `agent-dispatch sweep` moves it to `failed/`; re-submit |
 | Empty result in `failed/` | Worker quota silently returned nothing | Re-submit `--to auto` so it fails over |
 
 ## Uninstall
@@ -145,7 +173,7 @@ rm -rf ~/.agent-bus ~/.agent-bus-repo
 
 ## Notes and roadmap
 
-- Python 3.8+, stdlib only. No dependencies, no daemons, no network calls.
+- Python 3.8+, stdlib only. No dependencies or daemons. Optional completion notifications use ntfy.
   Queues are plain JSON files; results are plain text.
 - Model IDs churn: override per-worker defaults in `~/.agent-bus/config.json`
   (`default_models`), or pass `--model` per task. See

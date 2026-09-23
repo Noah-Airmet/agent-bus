@@ -14,7 +14,7 @@ truth:
 
 Optional config at ~/.agent-bus/config.json (created by install.sh):
 
-    {"default_models": {"codex": "gpt-5.6-luna"}, "disabled": ["grok"]}
+    {"default_models": {"codex": "gpt-6-luna"}, "disabled": []}
 """
 import argparse
 import datetime as dt
@@ -22,14 +22,17 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
+import tempfile
 import time
+import gzip
 from pathlib import Path
 from typing import Optional
 
 HOME = Path.home()
-BUS = HOME / ".agent-bus"
+BUS = Path(os.environ.get("AGENT_BUS_HOME", str(HOME / ".agent-bus"))).expanduser()
 CONFIG_PATH = BUS / "config.json"
 INBOX = BUS / "inbox"
 RUNNING = BUS / "running"
@@ -39,6 +42,19 @@ LOGS = BUS / "logs"
 WORKTREES = BUS / "worktrees"
 
 MAX_RESULT_BYTES = int(os.environ.get("AGENT_BUS_MAX_RESULT_BYTES", "2000000"))
+TERMINATION_SIGNAL = None
+ACTIVE_PROCESS = None
+
+
+def handle_termination(signum, _frame):
+    global TERMINATION_SIGNAL
+    TERMINATION_SIGNAL = signum
+    proc = ACTIVE_PROCESS
+    if proc is not None and proc.poll() is None:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except OSError:
+            proc.kill()
 
 AGENT_COMMANDS = {
     "cursor": ["cursor-agent", "--print", "--output-format", "text",
@@ -46,8 +62,7 @@ AGENT_COMMANDS = {
     "antigravity": ["agy", "--dangerously-skip-permissions", "-p"],
     "codex": ["codex", "exec", "--dangerously-bypass-approvals-and-sandbox",
               "-s", "danger-full-access"],
-    "claude": ["claude", "-p", "--dangerously-skip-permissions"],
-    "grok": ["grok", "--output-format", "plain", "--always-approve"],
+    "claude": ["claude", "-p"],
     "copilot": ["copilot", "--allow-all-tools", "--no-ask-user",
                 "--no-remote-export", "--log-level", "none",
                 "--max-ai-credits", "30"],
@@ -57,26 +72,26 @@ AGENT_COMMANDS = {
     "opencode": ["opencode", "run", "--format", "json", "--auto"],
 }
 
+CLAUDE_LANE_PROMPT = """A standing instruction from the user, the person you are working for. It is about how your turns end. A message with no tool call in it ends your turn, and the work stops there until you are asked to continue. The user has seen you end turns in four ways while work they asked for was still owed, and does not want any of them. One: a long summary of what was done that closes by announcing the next step and has no tool call, so the next thing never starts. Two: an offer to carry on with something unless the user would prefer otherwise, which stops to wait for an answer the user was not going to give. Three: a list of decisions for the user when, by your own account, none of them blocks the rest of the work. Four: deciding that this is a good place to report, because the turn has been long or a milestone is done. Status notes are welcome, and so are your recommendations on open decisions, but put them in the same message as your next tool call and carry on with whatever does not depend on the user's answer. If you notice yourself inviting the user to redirect you or offering to wait, delete it and do the next thing. The stops the user does want are the ones where nothing can move without them, or where the thing blocking you is deliberately protected from you. This does not override the need for confirmation on risky or destructive actions."""
+
 DEFAULT_MODELS = {
     "cursor": "composer-2.5",
     # agy accepts display names ("Gemini 3.8 Flash (High)") and suffixed
     # slugs (gemini-3.8-flash-high); reasoning tier is part of the id.
     "antigravity": "Gemini 3.8 Flash (High)",
-    "codex": "gpt-5.6-sol",
+    "codex": "gpt-6-luna",
     "claude": "sonnet",
-    "grok": "grok-4.5",
     "copilot": "auto",
     "opencode": "",
 }
 
 DEFAULT_EFFORT = {
-    "codex": "medium",
-    "grok": "high",
+    "codex": "high",
 }
 
 ROUTES = {
-    "auto": ["antigravity", "cursor", "opencode"],
-    "cheap": ["antigravity", "cursor", "opencode"],
+    "auto": ["codex", "antigravity", "cursor"],
+    "cheap": ["antigravity", "codex", "cursor"],
     "pm": ["codex", "claude"],
 }
 
@@ -119,7 +134,7 @@ def is_disabled(agent: str) -> bool:
 
 def executable_missing(agent: str) -> bool:
     exe = AGENT_COMMANDS[agent][0]
-    return shutil.which(exe) is None
+    return shutil.which(exe, path=worker_path()) is None
 
 
 def ensure_bus() -> None:
@@ -160,9 +175,9 @@ def task_prompt(task: dict) -> str:
     mode = task.get("mode", "read-only")
     scope = task.get("scope", "unspecified")
     result = task.get("result", str(DONE / f"{task['id']}.md"))
-    agents_md = read_optional(HOME / "AGENTS.md")
-    if agents_md:
-        context = (f"--- BEGIN ~/AGENTS.md ---\n{agents_md}\n--- END ~/AGENTS.md ---")
+    worker_rules = read_worker_rules()
+    if worker_rules:
+        context = (f"--- BEGIN worker-rules.md ---\n{worker_rules}\n--- END worker-rules.md ---")
     else:
         context = ("(No ~/AGENTS.md found. General policy: stay in scope, "
                    "don't exfiltrate secrets, prefer minimal diffs.)")
@@ -182,6 +197,7 @@ Rules:
 - If mode is write, keep edits within scope and summarize changed files.
 - Do not include secrets, tokens, passwords, or private keys in your output.
 - End with a concise result, risks, and recommended next step.
+- End your reply with a final line exactly "STATUS: DONE", "STATUS: PARTIAL" or "STATUS: BLOCKED — <reason>".
 
 House rules from the human who set up this machine:
 {context}
@@ -201,21 +217,34 @@ def read_optional(path: Path, limit: int = 20000) -> str:
     return text
 
 
+def read_worker_rules() -> str:
+    try:
+        raw = (BUS / "worker-rules.md").read_bytes()
+    except OSError:
+        return ""
+    if not raw:
+        return ""
+    text = raw[:8192].decode("utf-8", errors="replace")
+    if len(raw) > 8192:
+        text += "\n... [truncated by agent-dispatch] ..."
+    return text
+
+
 def worker_env() -> dict:
     env = dict(os.environ)
-    current = env.get("PATH", "")
-    parts = [part for part in current.split(os.pathsep) if part]
-    for path in reversed(EXTRA_PATHS):
-        if path not in parts:
-            parts.insert(0, path)
-    env["PATH"] = os.pathsep.join(parts)
+    env["PATH"] = worker_path(env.get("PATH", ""))
     # Best-effort: macOS keychain-stored Cursor API key for unattended runs.
-    # Silently skipped on other platforms or when absent.
+    if "CURSOR_API_KEY" not in env:
+        try:
+            key = (HOME / ".config" / "cursor" / "api-key").read_text().strip()
+            if key:
+                env["CURSOR_API_KEY"] = key
+        except OSError:
+            pass
     if "CURSOR_API_KEY" not in env and sys.platform == "darwin":
         try:
             key = subprocess.run(
-                ["security", "find-generic-password",
-                 "-s", "CURSOR_API_KEY", "-w"],
+                ["security", "find-generic-password", "-s", "CURSOR_API_KEY", "-w"],
                 capture_output=True, text=True, timeout=10,
             ).stdout.strip()
             if key:
@@ -225,18 +254,68 @@ def worker_env() -> dict:
     return env
 
 
+def worker_path(current: Optional[str] = None) -> str:
+    current = os.environ.get("PATH", "") if current is None else current
+    parts = [part for part in current.split(os.pathsep) if part]
+    for path in reversed(EXTRA_PATHS):
+        if path not in parts:
+            parts.insert(0, path)
+    nvm_bins = list((HOME / ".nvm" / "versions" / "node").glob("*/bin"))
+    if nvm_bins:
+        newest = max(nvm_bins, key=lambda p: tuple(int(x) for x in re.findall(r"\d+", p.parent.name)))
+        if str(newest) not in parts:
+            parts.insert(0, str(newest))
+    return os.pathsep.join(parts)
+
+
 def claim(path: Path) -> Path:
     running_path = RUNNING / path.name
     path.rename(running_path)
     return running_path
 
 
-def finish(task_path: Path, target_dir: Path, note: Optional[str] = None) -> Path:
+def notify_finished(task_id: str, status: str, agent: str, elapsed: float) -> None:
+    topic = os.environ.get("AGENT_BUS_NTFY_TOPIC", "").strip()
+    if not topic:
+        try:
+            topic = (HOME / ".config" / "agent-bus" / "ntfy-topic").read_text().strip()
+        except OSError:
+            return
+    if not topic:
+        return
+    try:
+        from urllib.request import Request, urlopen
+        body = f"{task_id}: {status} ({agent}, {elapsed:.1f}s)".encode()
+        req = Request("https://ntfy.sh/" + topic, data=body, method="POST")
+        urlopen(req, timeout=5).close()
+    except Exception:
+        pass
+
+
+def finish(task_path: Path, target_dir: Path, note: Optional[str] = None,
+           task: Optional[dict] = None) -> Path:
+    if task is not None:
+        task["finished_at"] = dt.datetime.now().astimezone().isoformat()
+        started = task.get("_started_monotonic")
+        elapsed = max(0.0, time.monotonic() - started) if started else 0.0
+        task["elapsed_s"] = round(elapsed, 3)
+        task.setdefault("exit_code", 0 if target_dir == DONE else 1)
+        task.setdefault("agent", task_target(task))
+        task["model"] = task.get("model") or default_model(task.get("agent", ""))
+        task["effort"] = task.get("effort") or DEFAULT_EFFORT.get(task.get("agent", ""))
+        task.setdefault("usage", {})
+        task.pop("_started_monotonic", None)
+        task_path.write_text(json.dumps(task, indent=2) + "\n", encoding="utf-8")
     target = target_dir / task_path.name
     task_path.rename(target)
     if note:
         note_path = target_dir / f"{target.stem}.note.txt"
         note_path.write_text(note, encoding="utf-8")
+    if task is not None:
+        notify_finished(task.get("id", target.stem),
+                        "done" if target_dir == DONE else "failed",
+                        task.get("agent", task_target(task)),
+                        task.get("elapsed_s", 0))
     return target
 
 
@@ -305,13 +384,26 @@ def _extract_opencode_text(raw: str) -> str:
 
 def build_worker_cmd(agent: str, task: dict, prompt: str) -> list:
     cmd = list(AGENT_COMMANDS[agent])
+    if agent == "codex":
+        cmd = ["codex", "exec"]
+        if task.get("mode") == "read-only":
+            cmd += ["-s", "read-only", "--skip-git-repo-check"]
+        else:
+            cmd += ["--dangerously-bypass-approvals-and-sandbox", "-s", "danger-full-access", "--skip-git-repo-check"]
+        cmd += ["--json", "-o", task["output_file"]]
+    elif agent == "claude" and task.get("mode") != "read-only":
+        cmd += ["--dangerously-skip-permissions"]
     model = task.get("model") or default_model(agent)
     if agent == "antigravity":
-        cmd = ["agy", "--dangerously-skip-permissions",
-               "--add-dir", task.get("cwd") or str(HOME)]
+        cmd = ["agy"]
+        if task.get("mode") != "read-only":
+            cmd += ["--dangerously-skip-permissions"]
+        cmd += ["--add-dir", task.get("cwd") or str(HOME)]
         if model:
             cmd += ["--model", model]
-        cmd += ["--print-timeout", f"{int(task.get('timeout') or 3600)}s"]
+        cmd += ["--print-timeout", f"{int(task.get('timeout_seconds') or 3600)}s"]
+        if task.get("mode") == "read-only":
+            cmd += ["--mode", "plan"]
         cmd += ["-p"]
     if agent == "cursor" and model:
         cmd += ["--model", model]
@@ -320,6 +412,10 @@ def build_worker_cmd(agent: str, task: dict, prompt: str) -> list:
     effort = task.get("effort") or DEFAULT_EFFORT.get(agent)
     if agent == "claude" and effort:
         cmd += ["--effort", effort]
+    if agent == "claude":
+        cmd += ["--output-format", "json", "--append-system-prompt", CLAUDE_LANE_PROMPT]
+        if task.get("mode") == "read-only":
+            cmd += ["--permission-mode", "plan"]
     if agent == "codex":
         if model:
             cmd += ["-m", model]
@@ -327,12 +423,6 @@ def build_worker_cmd(agent: str, task: dict, prompt: str) -> list:
             cmd += ["-c", f"model_reasoning_effort={effort}"]
         if task.get("cwd"):
             cmd += ["-C", task["cwd"]]
-    if agent == "grok":
-        if model:
-            cmd += ["-m", model]
-        if effort:
-            cmd += ["--reasoning-effort", effort]
-        cmd += ["--single"]
     if agent == "copilot":
         if model and model != "auto":
             cmd += ["--model", model]
@@ -348,17 +438,58 @@ def build_worker_cmd(agent: str, task: dict, prompt: str) -> list:
     return cmd
 
 
+def parse_worker_output(agent: str, raw: str, task: dict) -> tuple:
+    """Return clean final text and normalized usage from worker capture."""
+    usage = {}
+    if agent == "codex":
+        try:
+            final_path = Path(task["output_file"])
+            if final_path.exists():
+                text = final_path.read_text(encoding="utf-8", errors="replace")
+            else:
+                text = ""
+        except OSError:
+            text = ""
+        for line in raw.splitlines():
+            try:
+                event = json.loads(line)
+            except ValueError:
+                continue
+            if event.get("type") in ("event_msg", "turn.completed"):
+                payload = event.get("payload", event)
+                token_usage = payload.get("token_usage") or payload.get("usage")
+                if isinstance(token_usage, dict):
+                    usage.update(token_usage)
+            if event.get("type") == "thread.started":
+                payload = event.get("payload") or {}
+                if payload.get("thread_id"):
+                    usage["session_id"] = payload["thread_id"]
+        return text or raw, usage
+    if agent == "claude":
+        try:
+            data = json.loads(raw)
+        except ValueError:
+            return raw, usage
+        if isinstance(data, dict):
+            for key in ("total_cost_usd", "duration_ms", "num_turns", "session_id", "usage"):
+                if key in data:
+                    usage[key] = data[key]
+            return str(data.get("result", raw)), usage
+    return raw, usage
+
+
 def invoke_once(cmd: list, cwd: Path, timeout_seconds: int, log) -> tuple:
     display_cmd = [*cmd[:-1], "<prompt>"]
     log.write(f"$ {' '.join(display_cmd)}\ncwd={cwd}\n\n")
     log.flush()
+    proc = None
     try:
-        proc = subprocess.run(
+        proc = subprocess.Popen(
             cmd, cwd=str(cwd), env=worker_env(), text=True,
             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT, timeout=timeout_seconds,
+            stderr=subprocess.STDOUT, start_new_session=True,
         )
-        output = proc.stdout or ""
+        output, _ = proc.communicate(timeout=timeout_seconds)
         returncode = proc.returncode
         if returncode == 0 and not output.strip():
             returncode = 3
@@ -367,10 +498,15 @@ def invoke_once(cmd: list, cwd: Path, timeout_seconds: int, log) -> tuple:
         log.write(output)
         log.flush()
         return output, returncode
-    except subprocess.TimeoutExpired as exc:
-        raw = exc.stdout or b""
-        output = (raw.decode("utf-8", errors="replace")
-                  if isinstance(raw, bytes) else (raw or ""))
+    except subprocess.TimeoutExpired:
+        if proc is not None:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except OSError:
+                proc.kill()
+            output, _ = proc.communicate()
+        else:
+            output = ""
         log.write(output)
         log.write(f"\n[dispatcher] TimeoutExpired after {timeout_seconds}s\n")
         log.flush()
@@ -378,17 +514,35 @@ def invoke_once(cmd: list, cwd: Path, timeout_seconds: int, log) -> tuple:
 
 
 def run_task(path: Path) -> int:
+    global ACTIVE_PROCESS
     ensure_bus()
     running_path = claim(path)
     task = load_task(running_path)
     task["pid"] = os.getpid()
     task["started_at"] = time.time()
+    task["_started_monotonic"] = time.monotonic()
+    task["agent"] = task_target(task)
+    task.setdefault("usage", {})
     with running_path.open("w", encoding="utf-8") as _f:
         json.dump(task, _f, indent=2)
         _f.write("\n")
     agent = task_target(task)
 
     cwd = Path(task.get("cwd", str(HOME))).expanduser()
+    if task.get("worktree"):
+        try:
+            root = subprocess.run(["git", "-C", str(cwd), "rev-parse", "--show-toplevel"],
+                                  capture_output=True, text=True, check=True).stdout.strip()
+            branch = f"bus/{task['id']}"
+            worktree = WORKTREES / task["id"]
+            subprocess.run(["git", "-C", root, "worktree", "add", "-b", branch,
+                            str(worktree), "HEAD"], check=True, capture_output=True, text=True)
+            cwd = worktree
+            task.update({"worktree": str(worktree), "branch": branch,
+                         "cwd": str(worktree)})
+        except (OSError, subprocess.CalledProcessError) as exc:
+            finish(running_path, FAILED, f"Could not create requested worktree: {exc}", task)
+            return 2
     result_path = Path(task.get("result",
                                str(DONE / f"{task['id']}.md"))).expanduser()
     result_path.parent.mkdir(parents=True, exist_ok=True)
@@ -398,18 +552,25 @@ def run_task(path: Path) -> int:
         return run_route(running_path, task, agent)
 
     if agent not in AGENT_COMMANDS:
-        finish(running_path, FAILED, f"Unknown agent: {agent}")
+        task["exit_code"] = 2
+        finish(running_path, FAILED, f"Unknown agent: {agent}", task)
         return 2
     if is_disabled(agent):
-        finish(running_path, FAILED, f"Worker disabled in config: {agent}")
+        task["exit_code"] = 2
+        finish(running_path, FAILED, f"Worker disabled in config: {agent}", task)
         return 2
     if executable_missing(agent):
+        task["exit_code"] = 127
         finish(running_path, FAILED,
                f"Missing executable: {AGENT_COMMANDS[agent][0]} "
-               f"(is that worker CLI installed and logged in?)")
+               f"(is that worker CLI installed and logged in?)", task)
         return 127
 
     prompt = task_prompt(task)
+    if agent == "codex":
+        temp_output = tempfile.NamedTemporaryFile(prefix=f"{task['id']}-", suffix=".md", delete=False)
+        temp_output.close()
+        task["output_file"] = temp_output.name
     cmd = build_worker_cmd(agent, task, prompt)
     timeout_seconds = int(task.get("timeout_seconds", 3600))
     max_retries = int(task.get("retry", 2))
@@ -419,13 +580,21 @@ def run_task(path: Path) -> int:
 
     with log_path.open("w", encoding="utf-8") as log:
         for attempt in range(max_retries + 1):
+            if TERMINATION_SIGNAL is not None:
+                task["exit_code"] = 128 + TERMINATION_SIGNAL
+                finish(running_path, FAILED,
+                       f"dispatcher terminated by signal {TERMINATION_SIGNAL}", task)
+                return 128 + TERMINATION_SIGNAL
             if attempt > 0:
                 backoff = [5, 20, 60][min(attempt - 1, 2)]
                 log.write(f"\n--- transient failure on attempt {attempt}; "
                           f"retrying in {backoff}s "
                           f"(retry {attempt}/{max_retries}) ---\n\n")
                 log.flush()
-                time.sleep(backoff)
+                backoff_until = time.monotonic() + backoff
+                while (TERMINATION_SIGNAL is None
+                       and time.monotonic() < backoff_until):
+                    time.sleep(min(0.2, backoff_until - time.monotonic()))
             display_cmd = [*cmd[:-1], "<prompt>"]
             log.write(f"$ {' '.join(display_cmd)}\ncwd={cwd}\n\n")
             log.flush()
@@ -433,29 +602,35 @@ def run_task(path: Path) -> int:
                 proc = subprocess.Popen(
                     cmd, cwd=str(cwd), env=worker_env(), text=True,
                     stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT, bufsize=1,
+                    stderr=subprocess.STDOUT, start_new_session=True,
                 )
-                output_lines = []
-                deadline = time.time() + timeout_seconds
-                timed_out = False
-                for raw_line in proc.stdout:
-                    output_lines.append(raw_line)
-                    log.write(raw_line)
-                    log.flush()
-                    if time.time() >= deadline:
+                ACTIVE_PROCESS = proc
+                try:
+                    output, _ = proc.communicate(timeout=timeout_seconds)
+                except subprocess.TimeoutExpired:
+                    try:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                    except OSError:
                         proc.kill()
-                        timed_out = True
-                        break
-                proc.wait()
-                output = "".join(output_lines)
-                if timed_out:
+                    output, _ = proc.communicate()
                     log.write(f"\n[dispatcher] TimeoutExpired "
                               f"after {timeout_seconds}s\n")
                     log.flush()
-                    write_result_file(result_path, task, agent,
-                                      log_path, output, cwd)
-                    finish(running_path, FAILED, "Task timed out.")
+                    clean, usage = parse_worker_output(agent, output, task)
+                    task["usage"].update(usage)
+                    task["exit_code"] = 124
+                    write_result_file(result_path, task, agent, log_path, clean, cwd)
+                    finish(running_path, FAILED, "Task timed out.", task)
                     return 124
+                finally:
+                    ACTIVE_PROCESS = None
+                if TERMINATION_SIGNAL is not None:
+                    task["exit_code"] = 128 + TERMINATION_SIGNAL
+                    finish(running_path, FAILED,
+                           f"dispatcher terminated by signal {TERMINATION_SIGNAL}", task)
+                    return 128 + TERMINATION_SIGNAL
+                log.write(output or "")
+                log.flush()
                 returncode = proc.returncode
                 if returncode == 0 and not output.strip():
                     returncode = 3
@@ -489,12 +664,41 @@ def run_task(path: Path) -> int:
             output, returncode = invoke_once(auto_cmd, cwd,
                                              timeout_seconds, log)
 
-    write_result_file(result_path, task, agent, log_path, output, cwd)
+    clean_output, usage = parse_worker_output(agent, output, task)
+    task["usage"].update(usage)
+    write_result_file(result_path, task, agent, log_path, clean_output, cwd)
 
     if returncode == 0:
-        finish(running_path, DONE)
+        continuations = int(task.get("continuations", 1))
+        if needs_continuation(agent, clean_output, continuations):
+            continuation_prompt = ("Your reply ended without a STATUS line, so the work may be unfinished. "
+                                   "Continue the task. If it is done, say so. End with the STATUS line.")
+            task["continuations"] = continuations - 1
+            if agent == "claude":
+                data = json.loads(output)
+                resume = data.get("session_id")
+                resume_cmd = build_worker_cmd(agent, task, continuation_prompt)
+                resume_cmd[resume_cmd.index("-p") + 1:resume_cmd.index("-p") + 1] = ["--resume", resume]
+            else:
+                resume_cmd = ["codex", "exec", "resume"]
+                resume = task.get("usage", {}).get("session_id")
+                if resume:
+                    resume_cmd.append(str(resume))
+                resume_cmd += ["--json", "-o", task["output_file"], continuation_prompt]
+            with log_path.open("a", encoding="utf-8") as log:
+                output2, rc2 = invoke_once(resume_cmd, cwd, timeout_seconds, log)
+            clean2, usage2 = parse_worker_output(agent, output2, task)
+            task["usage"].update(usage2)
+            if rc2 == 0:
+                write_result_file(result_path, task, agent, log_path, clean2, cwd)
+            else:
+                returncode = rc2
+        task["exit_code"] = returncode
+        finish(running_path, DONE if returncode == 0 else FAILED,
+               None if returncode == 0 else f"Exit code: {returncode}", task)
     else:
-        finish(running_path, FAILED, f"Exit code: {returncode}")
+        task["exit_code"] = returncode
+        finish(running_path, FAILED, f"Exit code: {returncode}", task)
     return returncode
 
 
@@ -509,6 +713,19 @@ def quota_like_failure(output: str) -> bool:
     ]
     lower = output.lower()
     return any(marker in lower for marker in markers)
+
+
+def log_tail(path: Path, limit: int = 60000) -> str:
+    try:
+        with path.open("rb") as f:
+            f.seek(max(0, path.stat().st_size - limit))
+            return f.read().decode("utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
+def needs_continuation(agent: str, result: str, remaining: int) -> bool:
+    return agent in ("codex", "claude") and remaining > 0 and not re.search(r"^STATUS:", result, re.M)
 
 
 def run_route(running_path: Path, task: dict, route: str) -> int:
@@ -526,13 +743,27 @@ def run_route(running_path: Path, task: dict, route: str) -> int:
         attempt["id"] = f"{task['id']}--{agent}"
         attempt["result"] = str(DONE / f"{attempt['id']}.md")
         attempt["wrap_result"] = False
+        attempt["worktree"] = False
         attempt_path = write_task(attempt, RUNNING)
         rc = run_task(attempt_path)
         log_path = LOGS / f"{attempt['id']}.log"
-        output = read_optional(log_path, limit=60000)
+        output = log_tail(log_path)
         attempts.append((agent, rc, log_path, attempt["result"]))
         final_rc = rc
+        if TERMINATION_SIGNAL is not None:
+            task["exit_code"] = 128 + TERMINATION_SIGNAL
+            finish(running_path, FAILED,
+                   f"dispatcher terminated by signal {TERMINATION_SIGNAL}", task)
+            return 128 + TERMINATION_SIGNAL
         if rc == 0:
+            try:
+                lane_task = json.loads((DONE / f"{attempt['id']}.json").read_text())
+            except (OSError, ValueError):
+                lane_task = {}
+            task["agent"] = agent
+            task["model"] = lane_task.get("model") or attempt.get("model") or default_model(agent)
+            task["effort"] = lane_task.get("effort") or attempt.get("effort") or DEFAULT_EFFORT.get(agent)
+            task["usage"] = lane_task.get("usage", {})
             primary_result_path = Path(task.get(
                 "result", str(DONE / f"{task['id']}.md"))).expanduser()
             winning_output = read_optional(
@@ -552,17 +783,21 @@ def run_route(running_path: Path, task: dict, route: str) -> int:
             else:
                 primary_result_path.write_text(winning_output,
                                                encoding="utf-8")
-            finish(running_path, DONE)
+            finish(running_path, DONE, task=task)
             print(f"done: {primary_result_path}")
             print(f"winning-result: {attempt['result']}")
             return 0
         if not quota_like_failure(output):
             break
 
+    if attempts:
+        task["agent"] = attempts[-1][0]
+
     note = "Fallback attempts failed:\n" + "\n".join(
         f"- {a}: exit {r}, result {res}, log {p}" for a, r, p, res in attempts
     )
-    finish(running_path, FAILED, note)
+    task["exit_code"] = final_rc
+    finish(running_path, FAILED, note, task)
     return final_rc
 
 
@@ -594,7 +829,15 @@ def cmd_submit(args: argparse.Namespace) -> int:
         "result": result,
         "timeout_seconds": args.timeout,
         "retry": args.retry,
+        "continuations": args.continuations,
     }
+    if args.worktree:
+        check = subprocess.run(["git", "-C", task["cwd"], "rev-parse", "--show-toplevel"],
+                               capture_output=True, text=True)
+        if check.returncode != 0:
+            print(f"--worktree requires --cwd inside a git repository: {task['cwd']}", file=sys.stderr)
+            return 2
+        task["worktree"] = True
     if args.model:
         task["model"] = args.model
     if args.effort:
@@ -602,6 +845,14 @@ def cmd_submit(args: argparse.Namespace) -> int:
     if args.wrap_result:
         task["wrap_result"] = True
     path = write_task(task)
+    if args.bg:
+        log_path = LOGS / f"{task_id}.dispatcher.log"
+        with log_path.open("a", encoding="utf-8") as log:
+            subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "run", "--id", task_id],
+                             stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
+                             start_new_session=True, close_fds=True)
+        print(task_id)
+        return 0
     print(path)
     if args.run:
         rc = run_task(path)
@@ -609,6 +860,32 @@ def cmd_submit(args: argparse.Namespace) -> int:
         if result_path.exists():
             print(f"result: {result_path}")
         return rc
+    return 0
+
+
+def cmd_prune(args: argparse.Namespace) -> int:
+    ensure_bus()
+    cutoff = time.time() - args.older_than * 86400
+    active_ids = {p.stem for d in (INBOX, RUNNING) for p in d.glob("*.json")}
+    candidates = []
+    for directory, pattern in ((DONE, "*.md"), (FAILED, "*.md"), (LOGS, "*.log")):
+        for path in directory.glob(pattern):
+            task_id = path.stem
+            if path.suffix == ".log":
+                task_id = (path.name[:-len(".dispatcher.log")]
+                           if path.name.endswith(".dispatcher.log")
+                           else path.name[:-4])
+            if task_id in active_ids or path.stat().st_mtime >= cutoff or path.name.endswith(".gz"):
+                continue
+            candidates.append(path)
+    counts = {}
+    for path in candidates:
+        counts[path.parent.name] = counts.get(path.parent.name, 0) + 1
+        if not args.dry_run:
+            with path.open("rb") as source, gzip.open(str(path) + ".gz", "wb") as dest:
+                shutil.copyfileobj(source, dest)
+    for name in ("done", "failed", "logs"):
+        print(f"{name}: {counts.get(name, 0)} {'would gzip' if args.dry_run else 'gzipped'}")
     return 0
 
 
@@ -812,6 +1089,12 @@ def main() -> int:
                              "Default is raw model output.")
     submit.add_argument("--run", action="store_true",
                         help="Run immediately after queueing.")
+    submit.add_argument("--bg", action="store_true",
+                        help="Run in a detached dispatcher process and return the task id.")
+    submit.add_argument("--worktree", action="store_true",
+                        help="Run in a new isolated git worktree under the bus.")
+    submit.add_argument("--continuations", type=int, default=1,
+                        help="Maximum STATUS-line continuation runs (default 1).")
     submit.set_defaults(func=cmd_submit)
 
     run = sub.add_parser("run", help="Run queued tasks.")
@@ -846,7 +1129,19 @@ def main() -> int:
     workers = sub.add_parser("workers", help="Show installed worker CLIs.")
     workers.set_defaults(func=cmd_workers)
 
+    prune = sub.add_parser("prune", help="Gzip old result and log files without deleting them.")
+    prune.add_argument("--older-than", type=int, default=30)
+    prune.add_argument("--dry-run", action="store_true")
+    prune.set_defaults(func=cmd_prune)
+
     args = parser.parse_args()
+    if args.command == "submit" and args.continuations < 0:
+        parser.error("--continuations must be non-negative")
+    if args.command == "run" or (args.command == "submit" and args.run):
+        if hasattr(signal, "SIGHUP"):
+            signal.signal(signal.SIGHUP, signal.SIG_IGN)
+        signal.signal(signal.SIGTERM, handle_termination)
+        signal.signal(signal.SIGINT, handle_termination)
     return args.func(args)
 
 
