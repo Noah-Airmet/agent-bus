@@ -115,8 +115,8 @@ agent-dispatch list done
 |---|---|---|
 | antigravity | Gemini 3.8 Flash High | `-low` + caching for bulk; High for coding |
 | codex | `gpt-5.6-sol` | `gpt-6-luna` at high effort — the workhorse for scoped jobs with acceptance tests (needs Codex CLI ≥0.155) |
-| claude | `sonnet` | `claude-opus-5-5` as the planner/reviewer; `claude-fable-5-1` hardest jobs |
-| cursor | `composer-2.5` | Gateway to 200+ models incl. Fable, Sol, Gemini |
+| claude | `sonnet` | `claude-opus-5-5` as the planner/reviewer and for the hardest jobs |
+| cursor | `composer-2.5` | Gateway to 200+ models incl. Opus, Sol, Gemini |
 | opencode | worker default | `opencode-go/gpt-5.6-luna`, `opencode-go/muse-spark-1.3` |
 | copilot | `auto` | GitHub chores only, small monthly budget |
 - Prefer `--mode read-only` for research/audits/summaries. Write tasks need
