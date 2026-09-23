@@ -110,6 +110,7 @@ class DispatchTests(unittest.TestCase):
         self.assertTrue(ad.needs_continuation("codex", "answer", 1))
         self.assertFalse(ad.needs_continuation("codex", "answer\nSTATUS: PARTIAL", 1))
         self.assertFalse(ad.needs_continuation("cursor", "answer", 1))
+        self.assertFalse(ad.needs_continuation("codex", "rejected (`EPERM`). STATUS: BLOCKED — read-only", 1))
 
     def test_codex_continues_once_without_status_but_not_partial(self):
         count = self.home / "calls"
@@ -119,7 +120,7 @@ class DispatchTests(unittest.TestCase):
             'out=""; prev=""; for a in "$@"; do if [ "$prev" = "-o" ]; then out="$a"; fi; prev="$a"; done\n'
             'if [ "$n" -eq 1 ]; then echo \'{"type":"thread.started","thread_id":"fake-session"}\'; '
             'printf "answer without status" > "$out"; else echo \'{"type":"turn.completed","usage":{"output_tokens":2}}\'; '
-            'printf "answer\\nSTATUS: DONE\\n" > "$out"; fi')
+            'case "$*" in *fake-session*) ;; *) exit 9;; esac; case "$*" in *sandbox_mode*read-only*) ;; *) exit 8;; esac; printf "answer\\nSTATUS: DONE\\n" > "$out"; fi')
         try:
             ad.AGENT_COMMANDS["codex"] = ["codex"]
             task = {"id": "continue-once", "to": "codex", "mode": "read-only", "cwd": str(self.home),
@@ -197,7 +198,7 @@ class DispatchTests(unittest.TestCase):
         self.assertEqual(text, "hello")
         self.assertEqual(usage["total_cost_usd"], .01)
 
-    def test_prune_gzips_old_files_and_retains_source_in_dry_run(self):
+    def test_prune_replaces_old_files_with_gzip(self):
         from argparse import Namespace
         old = ad.DONE / "old.md"
         old.write_text("result")
@@ -205,8 +206,10 @@ class DispatchTests(unittest.TestCase):
         ad.cmd_prune(Namespace(older_than=30, dry_run=True))
         self.assertTrue(old.exists())
         ad.cmd_prune(Namespace(older_than=30, dry_run=False))
-        self.assertTrue(old.exists())
-        self.assertTrue((ad.DONE / "old.md.gz").exists())
+        self.assertFalse(old.exists())
+        import gzip as _gz
+        with _gz.open(str(ad.DONE / "old.md.gz"), "rt") as f:
+            self.assertEqual(f.read(), "result")
 
     def test_finish_metrics(self):
         task = {"id": "metric", "to": "codex", "mode": "read-only", "_started_monotonic": ad.time.monotonic()}

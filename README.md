@@ -113,14 +113,15 @@ can use `--timeout SECONDS` to set the worker deadline. The dispatcher kills
 the worker process group at the deadline. Foreground runs ignore SIGHUP and
 record a failed task if they receive SIGTERM or SIGINT.
 
-`agent-dispatch prune --older-than DAYS [--dry-run]` writes `.gz` copies of old
-result and log files (30 days by default); it keeps the original files and
-skips active task IDs. On task completion, an optional ntfy message is sent using
+`agent-dispatch prune --older-than DAYS [--dry-run]` gzips result and log files
+older than DAYS (30 by default) in place, like `gzip`: each file is replaced by
+a verified `.gz` with the same mtime; nothing is deleted outright. Files for
+queued or running tasks are skipped. On task completion, an optional ntfy message is sent using
 `AGENT_BUS_NTFY_TOPIC` or the local `ntfy-topic` setting file. Messages contain
 only the task ID, outcome, worker, and elapsed time.
 
-- `--to auto` tries cheap/fast workers first and falls through on quota or
-  auth failures — the right default when you don't care who does it.
+- `--to auto` tries codex → antigravity → cursor and falls through on quota
+  or auth failures.
 - A worker gets **one prompt**. Brief it like a colleague with your tools
   and none of your context: goal, current state, constraints, output format.
 - Results land in `~/.agent-bus/done/<id>.md` (final worker response, no
@@ -141,7 +142,7 @@ only the task ID, outcome, worker, and elapsed time.
 |---|---|
 | Codex | Uses the CLI `read-only` sandbox. |
 | Claude | Uses permission mode `plan`. |
-| Antigravity | Uses mode `plan`. |
+| Antigravity | **Prompt-only.** `agy --mode plan` headless either denies all tools (without `--dangerously-skip-permissions`) or still writes (with it). |
 | Cursor | The installed CLI did not expose a verified read-only mode; its existing sandbox options are retained. |
 | Copilot, opencode | No verified read-only mode is wired; existing worker behavior is retained. |
 
@@ -159,7 +160,8 @@ instruct workers not to edit. Routes inherit the selected worker's behavior.
 | `Missing executable` | That worker's CLI isn't installed | Use a different `--to`, or help the human install it |
 | Task fails mentioning login/auth/quota | Worker CLI not logged in, or plan quota spent | Route to another worker (`--to auto` does this itself); ask human to log in or wait for quota reset |
 | `command not found: agent-dispatch` | `~/.local/bin` not on PATH | Add `export PATH="$HOME/.local/bin:$PATH"` to `~/.zshrc`, restart terminal |
-| Task sits in `running/` forever | An older dispatcher process was killed | `agent-dispatch sweep` moves it to `failed/`; re-submit |
+| Task sits in `running/` forever | An older dispatcher process was killed | `agent-dispatch sweep` moves it to `failed/`; re-submit. Use `--bg` so the dispatcher outlives your shell |
+| Claude or Cursor fails over SSH/launchd ("Not logged in", "keychain is locked") | macOS login keychain isn't available to non-GUI sessions | Put a long-lived token in `~/.config/claude/oauth-token` (from `claude setup-token`) or `~/.config/cursor/api-key`, mode 0600; the dispatcher reads them |
 | Empty result in `failed/` | Worker quota silently returned nothing | Re-submit `--to auto` so it fails over |
 
 ## Uninstall
