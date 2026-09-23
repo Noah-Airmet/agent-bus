@@ -237,14 +237,15 @@ def worker_env() -> dict:
     # Claude and Cursor read long-lived tokens from 0600 files when present.
     if "CLAUDE_CODE_OAUTH_TOKEN" not in env:
         try:
-            token = (HOME / ".config" / "claude" / "oauth-token").read_text().strip()
+            # Tokens never contain whitespace; a wrapped paste must not break them.
+            token = "".join((HOME / ".config" / "claude" / "oauth-token").read_text().split())
             if token:
                 env["CLAUDE_CODE_OAUTH_TOKEN"] = token
         except OSError:
             pass
     if "CURSOR_API_KEY" not in env:
         try:
-            key = (HOME / ".config" / "cursor" / "api-key").read_text().strip()
+            key = "".join((HOME / ".config" / "cursor" / "api-key").read_text().split())
             if key:
                 env["CURSOR_API_KEY"] = key
         except OSError:
