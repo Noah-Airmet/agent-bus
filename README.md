@@ -109,13 +109,13 @@ agent-dispatch list done
 - Results land in `~/.agent-bus/done/<id>.md` (raw worker output, no
   wrapper). Read the file yourself; never ask the human to check it.
 
-### Recommended models (Sep 2026 — IDs churn, verify with each tool's list command)
+### Recommended models (late Sep 2026 — IDs churn, verify with each tool's list command)
 
 | Worker | Default | Worth knowing |
 |---|---|---|
 | antigravity | Gemini 3.8 Flash High | `-low` + caching for bulk; High for coding |
-| codex | `gpt-5.6-sol` | `gpt-5.6-luna` — best cost-per-task for long runs |
-| claude | `sonnet` | `claude-opus-5` heavy work; `claude-fable-5-1` hardest jobs |
+| codex | `gpt-5.6-sol` | `gpt-6-luna` at high effort — the workhorse for scoped jobs with acceptance tests (needs Codex CLI ≥0.155) |
+| claude | `sonnet` | `claude-opus-5-5` as the planner/reviewer; `claude-fable-5-1` hardest jobs |
 | cursor | `composer-2.5` | Gateway to 200+ models incl. Fable, Sol, Gemini |
 | opencode | worker default | `opencode-go/gpt-5.6-luna`, `opencode-go/muse-spark-1.3` |
 | copilot | `auto` | GitHub chores only, small monthly budget |
