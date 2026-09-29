@@ -131,9 +131,10 @@ only the task ID, outcome, worker, and elapsed time.
 
 | Worker | Default | Worth knowing |
 |---|---|---|
-| Principal / reviewer | Opus 5.5 | Planning and review |
-| Workhorse | `gpt-6-luna` at high effort | Scoped implementation and analysis |
-| Backup | Gemini 3.8 Flash | Antigravity lane |
+| Principal / reviewer | Opus 5.5 at high effort | Taste, planning, brainstorming and review |
+| Implementation | `gpt-6.1-sol` at medium effort | `--to codex --model gpt-6.1-sol --effort medium`; needs Codex CLI ≥ 0.159 |
+| Throughput | `gpt-6-luna` at high effort | Codex default; bulk and fan-out |
+| Fallback | Sonnet 5.5 at medium effort | `--to claude --effort medium`; shares the Claude Pro window |
 | Overflow | Cursor | Use when other lanes are unavailable or constrained |
 
 ### Read-only behavior
