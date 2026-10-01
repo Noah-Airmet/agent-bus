@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { Register } from 'claude-code'
 
-import type { BusComposer, BusDetail, BusSnapshot } from '../types'
+import type { BusComposer, BusDetail, BusSnapshot, BusTask } from '../types'
 import { paneView, selectedOf } from './pane-view'
 import type { PaneActions, Ui } from './pane-view'
 import * as Words from './words'
@@ -19,10 +19,16 @@ const composerAtom = atom(
 )
 
 /**
- * How often the queue folders' modification times are compared: a task
- * queued, claimed or finished changes one, and only then is the bus asked.
+ * How often this machine's queue folders' modification times are compared:
+ * a task queued, claimed or finished changes one, and only then is the bus
+ * asked.
  */
 const WATCH_MS = 2_000
+
+/**
+ * How often another machine's bus is asked: no folder to watch over ssh.
+ */
+const REMOTE_POLL_MS = 5_000
 
 /**
  * While a task runs, how often the bus is asked anyway, so its time moves.
@@ -30,6 +36,11 @@ const WATCH_MS = 2_000
 const ACTIVE_REFRESH_MS = 15_000
 
 const QUEUES = ['inbox', 'running', 'done', 'failed'] as const
+
+/**
+ * The `$.store` key remembering the folder last dispatched to on a machine.
+ */
+const cwdKeyOf = (host: string): string => `cwd:${host}`
 
 type RunResult = { exitCode: number; stdout: string; stderr: string }
 
@@ -45,16 +56,17 @@ type Host = {
   ) => Promise<RunResult>
   now: () => Promise<number>
   mtime: (path: string) => Promise<number>
-  readFile: (path: string) => Promise<string | null>
   toast: (text: string) => void
   status: (text: string | undefined) => void
   note: (text: string) => Promise<void>
+  storeGet: (key: string) => Promise<unknown>
+  storeSet: (key: string, value: unknown) => Promise<void>
   getSelected: () => Promise<string | null>
-  setSelected: (id: string) => Promise<unknown>
+  setSelected: (key: string) => Promise<unknown>
   getDetail: () => Promise<BusDetail | null>
   setDetail: (detail: BusDetail) => Promise<unknown>
   setSnapshot: (snapshot: BusSnapshot) => Promise<unknown>
-  toggleArmed: (id: string) => Promise<unknown>
+  toggleArmed: (key: string) => Promise<unknown>
   getComposer: () => Promise<BusComposer | null>
   editComposer: (
     edit: (composer: BusComposer | null) => BusComposer | null,
@@ -64,7 +76,11 @@ type Host = {
 const firstLine = (text: string): string =>
   text.trim().split('\n')[0]?.slice(0, 200) ?? ''
 
-export const register: Register = on => {
+export const register: Register = (on, options) => {
+  const hosts = Words.hostsOf(options.hosts)
+  const hasLocal = hosts.includes(Words.LOCAL)
+  const hasRemote = hosts.some(machine => machine !== Words.LOCAL)
+
   let host: Host | null = null
   let home: string | undefined
   let busHome = ''
@@ -80,12 +96,79 @@ export const register: Register = on => {
   let statusText: string | undefined
   let carrying: string | null = null
 
-  const errorSnapshot = (error: string): BusSnapshot => ({
-    now: Date.now() / 1000,
-    counts: { queued: 0, running: 0, done: 0, failed: 0 },
-    tasks: [],
-    error,
-  })
+  /**
+   * Runs agent-dispatch with these arguments on a machine: this one's
+   * directly, another's over ssh; the origin, when given, rides in the
+   * dispatcher's environment either way.
+   */
+  function bus(
+    engine: Host,
+    machine: string,
+    args: string[],
+    timeoutMs: number,
+    origin?: string,
+  ): Promise<RunResult> {
+    if (machine === Words.LOCAL) {
+      return engine.run(
+        [dispatch, ...args],
+        timeoutMs,
+        origin ? { AGENT_BUS_ORIGIN: origin } : undefined,
+      )
+    }
+
+    return engine.run(
+      Words.sshArgvOf(machine, Words.remoteCommandOf(args, origin)),
+      timeoutMs + 5_000,
+    )
+  }
+
+  async function answerOf(
+    engine: Host,
+    machine: string,
+  ): Promise<Words.HostAnswer> {
+    const failure =
+      machine === Words.LOCAL
+        ? `Couldn't run ${Words.homeFolded(dispatch, home)}. Is the agent bus installed?`
+        : `Couldn't reach the bus on ${machine}.`
+
+    const run = await bus(
+      engine,
+      machine,
+      ['status', '--json', '--recent', '20'],
+      15_000,
+    ).catch(() => null)
+
+    if (run === null || run.exitCode !== 0) {
+      const why = run === null ? '' : firstLine(run.stderr)
+
+      return {
+        host: machine,
+        status: null,
+        error: why ? `${failure} ${why}` : failure,
+      }
+    }
+
+    try {
+      return { host: machine, status: JSON.parse(run.stdout), error: null }
+    } catch {
+      return {
+        host: machine,
+        status: null,
+        error: `${failure} It answered something other than JSON.`,
+      }
+    }
+  }
+
+  /**
+   * A finished task's result text, asked of the machine that ran it.
+   */
+  async function resultOf(engine: Host, task: BusTask): Promise<string | null> {
+    const run = await bus(engine, task.host, ['result', task.id], 15_000).catch(
+      () => null,
+    )
+
+    return run !== null && run.exitCode === 0 ? run.stdout : null
+  }
 
   /**
    * Toasts each task that finished since the last poll, unless another
@@ -98,15 +181,17 @@ export const register: Register = on => {
     const finished = snapshot.tasks.filter(task => !Words.isActive(task))
 
     if (seenFinished === null) {
-      seenFinished = new Set(finished.map(task => task.id))
+      seenFinished = new Set(finished.map(Words.taskKeyOf))
 
       return
     }
 
     for (const task of finished) {
-      if (seenFinished.has(task.id)) continue
+      const key = Words.taskKeyOf(task)
 
-      seenFinished.add(task.id)
+      if (seenFinished.has(key)) continue
+
+      seenFinished.add(key)
 
       if (task.origin && task.origin !== sessionId) continue
 
@@ -137,17 +222,19 @@ export const register: Register = on => {
 
     if (!task) return
 
+    const key = Words.taskKeyOf(task)
+
     if (Words.isActive(task)) {
-      if (detail?.id !== task.id || detail.text !== null) {
-        await engine.setDetail({ id: task.id, text: null })
+      if (detail?.id !== key || detail.text !== null) {
+        await engine.setDetail({ id: key, text: null })
       }
 
       return
     }
 
-    if (detail?.id === task.id && detail.text !== null) return
+    if (detail?.id === key && detail.text !== null) return
 
-    const text = await engine.readFile(task.result)
+    const text = await resultOf(engine, task)
 
     const shown =
       text === null
@@ -158,7 +245,7 @@ export const register: Register = on => {
               : text,
           )
 
-    await engine.setDetail({ id: task.id, text: shown })
+    await engine.setDetail({ id: key, text: shown })
   }
 
   async function poll(engine: Host) {
@@ -167,89 +254,123 @@ export const register: Register = on => {
     isPolling = true
 
     try {
-      const run = await engine.run(
-        [dispatch, 'status', '--json', '--recent', '20'],
-        15_000,
+      const answers = await Promise.all(
+        hosts.map(machine => answerOf(engine, machine)),
       )
 
-      const snapshot: BusSnapshot =
-        run.exitCode === 0
-          ? { ...JSON.parse(run.stdout), error: null }
-          : errorSnapshot(
-              `agent-dispatch status failed: ${firstLine(run.stderr)}`,
-            )
-
       lastPollAt = await engine.now()
+
+      const snapshot = Words.mergedSnapshotOf(answers, lastPollAt / 1000)
+
       latest = snapshot
 
       await announce(engine, snapshot)
       await engine.setSnapshot(snapshot)
       syncStatus(engine, snapshot)
       await refreshDetail(engine)
-    } catch {
-      latest = errorSnapshot(
-        `Couldn't run ${Words.homeFolded(dispatch, home)}. ` +
-          'Is the agent bus installed?',
-      )
-
-      await engine.setSnapshot(latest).catch(() => undefined)
     } finally {
       isPolling = false
     }
   }
 
   async function tick(engine: Host) {
-    const stamps = await Promise.all(
-      QUEUES.map(queue => engine.mtime(`${busHome}/${queue}`)),
-    )
+    const now = await engine.now()
+
+    const stamps = hasLocal
+      ? await Promise.all(
+          QUEUES.map(queue => engine.mtime(`${busHome}/${queue}`)),
+        )
+      : []
 
     const next = stamps.join(':')
     const hasActive = latest?.tasks.some(Words.isActive) ?? false
-    const isDue = (await engine.now()) - lastPollAt >= ACTIVE_REFRESH_MS
 
-    if (next !== signature || (hasActive && isDue)) {
+    const isDue =
+      next !== signature ||
+      (hasRemote && now - lastPollAt >= REMOTE_POLL_MS) ||
+      (hasActive && now - lastPollAt >= ACTIVE_REFRESH_MS)
+
+    if (isDue) {
       signature = next
       await poll(engine)
     }
   }
 
+  /**
+   * The folder a new task on this machine starts in: the one last
+   * dispatched to there, else the session's here and the home elsewhere.
+   */
+  async function cwdFor(engine: Host, machine: string): Promise<string> {
+    const kept = await engine.storeGet(cwdKeyOf(machine)).catch(() => null)
+
+    if (typeof kept === 'string' && kept) return kept
+
+    return machine === Words.LOCAL ? sessionCwd : '~'
+  }
+
   function actionsOf(engine: Host): PaneActions {
+    const taskOf = (key: string) =>
+      latest?.tasks.find(task => Words.taskKeyOf(task) === key)
+
     return {
-      select: id => {
-        void engine.setSelected(id).then(() => refreshDetail(engine))
+      select: key => {
+        void engine.setSelected(key).then(() => refreshDetail(engine))
       },
-      cancel: id => {
+      cancel: key => {
+        const task = taskOf(key)
+
+        if (!task) return
+
         void (async () => {
-          const run = await engine
-            .run([dispatch, 'cancel', id], 30_000)
-            .catch(() => null)
+          const run = await bus(
+            engine,
+            task.host,
+            ['cancel', task.id],
+            30_000,
+          ).catch(() => null)
 
           engine.toast(
             run === null
-              ? `Couldn't run agent-dispatch cancel ${id}`
+              ? `Couldn't run agent-dispatch cancel ${task.id}`
               : firstLine(run.exitCode === 0 ? run.stdout : run.stderr),
           )
 
           await poll(engine)
         })()
       },
-      toggleAsk: id => {
-        void engine.toggleArmed(id)
+      toggleAsk: key => {
+        void engine.toggleArmed(key)
       },
       compose: () => {
-        void engine.editComposer(composer => ({
-          isOpen: true,
-          lane: composer?.lane ?? 'luna',
-          mode: composer?.mode ?? 'read-only',
-          cwd: composer?.cwd ?? sessionCwd,
-          prompt: composer?.prompt ?? '',
-          isSending: false,
-        }))
+        void (async () => {
+          const current = await engine.getComposer()
+          const machine = current?.host ?? hosts[0] ?? Words.LOCAL
+          const cwd = current?.cwd ?? (await cwdFor(engine, machine))
+
+          await engine.editComposer(composer => ({
+            isOpen: true,
+            host: machine,
+            lane: composer?.lane ?? 'luna',
+            mode: composer?.mode ?? 'read-only',
+            cwd,
+            prompt: composer?.prompt ?? '',
+            isSending: false,
+          }))
+        })()
       },
       discard: () => {
         void engine.editComposer(
           composer => composer && { ...composer, isOpen: false, prompt: '' },
         )
+      },
+      setHost: machine => {
+        void (async () => {
+          const cwd = await cwdFor(engine, machine)
+
+          await engine.editComposer(
+            composer => composer && { ...composer, host: machine, cwd },
+          )
+        })()
       },
       setLane: lane => {
         void engine.editComposer(composer => composer && { ...composer, lane })
@@ -262,11 +383,16 @@ export const register: Register = on => {
         )
       },
       setCwd: cwd => {
-        const path = home && cwd.startsWith('~') ? home + cwd.slice(1) : cwd
+        void engine.editComposer(composer => {
+          if (!composer) return composer
 
-        void engine.editComposer(
-          composer => composer && { ...composer, cwd: path },
-        )
+          const isHere = composer.host === Words.LOCAL
+
+          const path =
+            isHere && home && cwd.startsWith('~') ? home + cwd.slice(1) : cwd
+
+          return { ...composer, cwd: path }
+        })
       },
       setPrompt: prompt => {
         void engine.editComposer(composer => composer && { ...composer, prompt })
@@ -278,8 +404,9 @@ export const register: Register = on => {
   }
 
   /**
-   * Dispatches the form in the background under this session's origin, so
-   * its finish reports here; then shows the new task and clears the form.
+   * Dispatches the form in the background on its machine, under this
+   * session's origin so its finish reports here; then shows the new task,
+   * remembers the folder, and clears the form.
    */
   async function submit(engine: Host, prompt: string) {
     const composer = await engine.getComposer()
@@ -287,9 +414,9 @@ export const register: Register = on => {
     if (!composer || composer.isSending) return
 
     const id = Words.taskIdOf(prompt, new Date(await engine.now()))
-    const argv = Words.submitArgvOf(dispatch, { ...composer, prompt }, id)
+    const args = Words.submitArgsOf({ ...composer, prompt }, id)
 
-    if (!argv) {
+    if (!args) {
       engine.toast('Type a prompt and a folder first')
 
       return
@@ -299,9 +426,9 @@ export const register: Register = on => {
       current => current && { ...current, prompt, isSending: true },
     )
 
-    const run = await engine
-      .run(argv, 30_000, { AGENT_BUS_ORIGIN: sessionId })
-      .catch(() => null)
+    const run = await bus(engine, composer.host, args, 30_000, sessionId).catch(
+      () => null,
+    )
 
     if (run === null || run.exitCode !== 0) {
       engine.toast(
@@ -317,14 +444,20 @@ export const register: Register = on => {
       return
     }
 
-    engine.toast(`Dispatched ${id} to ${composer.lane}`)
+    const where = composer.host === Words.LOCAL ? '' : ` on ${composer.host}`
+
+    engine.toast(`Dispatched ${id} to ${composer.lane}${where}`)
+
+    await engine
+      .storeSet(cwdKeyOf(composer.host), composer.cwd)
+      .catch(() => undefined)
 
     await engine.editComposer(
       current =>
         current && { ...current, isOpen: false, prompt: '', isSending: false },
     )
 
-    await engine.setSelected(id)
+    await engine.setSelected(Words.taskKeyOf({ host: composer.host, id }))
     await poll(engine)
   }
 
@@ -346,7 +479,6 @@ export const register: Register = on => {
           .stat(path)
           .then(stat => stat.mtimeMs)
           .catch(() => 0),
-      readFile: path => $.fs.read(path).catch(() => null),
       toast: text => $.ui.toast(text, { timeoutMs: 6_000 }),
       status: text => $.ui.status(text),
       note: async text => {
@@ -354,13 +486,15 @@ export const register: Register = on => {
           message: { type: 'user', content: [{ type: 'text', text }] },
         })
       },
+      storeGet: key => $.store.get(key),
+      storeSet: (key, value) => $.store.set(key, value),
       getSelected: () => read($, selectedAtom),
-      setSelected: id => update($, selectedAtom, () => id),
+      setSelected: key => update($, selectedAtom, () => key),
       getDetail: () => read($, detailAtom),
       setDetail: detail => update($, detailAtom, () => detail),
       setSnapshot: snapshot => update($, snapshotAtom, () => snapshot),
-      toggleArmed: id =>
-        update($, armedAtom, armed => (armed === id ? null : id)),
+      toggleArmed: key =>
+        update($, armedAtom, armed => (armed === key ? null : key)),
       getComposer: () => read($, composerAtom),
       editComposer: edit => update($, composerAtom, edit),
     }
@@ -374,7 +508,7 @@ export const register: Register = on => {
 
     const started = await next(e)
 
-    void poll(engine)
+    void poll(engine).catch(() => undefined)
 
     $.clock.every(WATCH_MS, () => {
       void tick(engine).catch(() => undefined)
@@ -410,7 +544,7 @@ export const register: Register = on => {
         : { id: Words.PANE_ID, title: Words.PANE_TITLE },
     )
 
-    if (host) void poll(host)
+    if (host) void poll(host).catch(() => undefined)
 
     if (isInline) return {}
 
@@ -436,6 +570,7 @@ export const register: Register = on => {
       const { Box, Text, Button, Markdown, Input, Select } = (await $.ui.resolve(
         e,
       )) as Ui
+
       const isDocked = e.props.placement === 'dock'
 
       const [snapshot, selected, detail, armed, composer] = await Promise.all([
@@ -461,9 +596,9 @@ export const register: Register = on => {
 
   on('prompt.submit', async ($, e, next) => {
     const armed = await read($, armedAtom)
-    const task = latest?.tasks.find(one => one.id === armed)
+    const task = latest?.tasks.find(one => Words.taskKeyOf(one) === armed)
 
-    if (!armed || !task || carrying === armed) return next(e)
+    if (!armed || !task || !host || carrying === armed) return next(e)
 
     const context = e.context ?? []
 
@@ -471,7 +606,7 @@ export const register: Register = on => {
       Words.PROMPT_CONTEXT_MAX_CHARS -
       context.reduce((sum, entry) => sum + entry.length, 0)
 
-    const result = await $.fs.read(task.result).catch(() => null)
+    const result = await resultOf(host, task)
     const text = result === null ? undefined : Words.askTextOf(task, result, room)
 
     if (text === undefined) {

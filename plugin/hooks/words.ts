@@ -83,11 +83,10 @@ export function taskIdOf(prompt: string, at: Date): string {
 }
 
 /**
- * The argument vector that submits the form, run in the background so the
- * call returns at once; the folder bounds a writing task's scope.
+ * The agent-dispatch arguments that submit the form, run in the background
+ * so the call returns at once; the folder bounds a writing task's scope.
  */
-export function submitArgvOf(
-  dispatch: string,
+export function submitArgsOf(
   composer: { lane: string; mode: string; cwd: string; prompt: string },
   id: string,
 ): string[] | null {
@@ -97,7 +96,6 @@ export function submitArgvOf(
   if (!lane || !prompt || !composer.cwd.trim()) return null
 
   return [
-    dispatch,
     'submit',
     ...lane.argv,
     '--mode',
@@ -112,6 +110,130 @@ export function submitArgvOf(
     '--bg',
     prompt,
   ]
+}
+
+/**
+ * This machine's bus, as the `hosts` option names it.
+ */
+export const LOCAL = 'local'
+
+/**
+ * Where a remote machine's dispatcher is, left unquoted so its shell
+ * expands the home directory.
+ */
+export const REMOTE_DISPATCH = '~/.local/bin/agent-dispatch'
+
+/**
+ * The machines the `hosts` option names, in order and once each: `local` or
+ * ssh aliases (letters, digits, `.`, `_`, `-`); anything else is dropped.
+ */
+export function hostsOf(option: unknown): string[] {
+  const names = String(option ?? '')
+    .split(/[\s,]+/)
+    .map(name => name.trim())
+    .filter(name => /^[A-Za-z0-9._-]+$/.test(name) && !name.startsWith('-'))
+
+  const unique = [...new Set(names)]
+
+  return unique.length > 0 ? unique : [LOCAL]
+}
+
+/**
+ * One word for a POSIX shell: single-quoted, with each `'` closed, escaped
+ * and reopened.
+ */
+export const shellQuote = (word: string): string =>
+  `'${word.replace(/'/g, `'\\''`)}'`
+
+/**
+ * The command a remote shell runs for these dispatcher arguments, the
+ * origin set in its environment when given.
+ */
+export function remoteCommandOf(args: string[], origin?: string): string {
+  const env = origin ? `env AGENT_BUS_ORIGIN=${shellQuote(origin)} ` : ''
+
+  return `${env}${REMOTE_DISPATCH} ${args.map(shellQuote).join(' ')}`
+}
+
+/**
+ * The ssh argument vector that runs a command on `alias`: never prompting,
+ * giving up on an unreachable machine in seconds, and sharing one
+ * connection between polls.
+ */
+export function sshArgvOf(alias: string, command: string): string[] {
+  return [
+    'ssh',
+    '-o',
+    'BatchMode=yes',
+    '-o',
+    'ConnectTimeout=5',
+    '-o',
+    'ControlMaster=auto',
+    '-o',
+    'ControlPath=/tmp/agent-bus-ssh-%C',
+    '-o',
+    'ControlPersist=120',
+    alias,
+    command,
+  ]
+}
+
+/**
+ * A task's address across machines.
+ */
+export const taskKeyOf = (task: { host: string; id: string }): string =>
+  `${task.host}/${task.id}`
+
+/**
+ * What one machine's bus answered: its parsed `status --json`, or why not.
+ */
+export type HostAnswer = {
+  host: string
+  status: { tasks?: Omit<BusTask, 'host'>[] } | null
+  error: string | null
+}
+
+/**
+ * The machines' answers as one snapshot: every active task in the order the
+ * machines are listed, then the most recent finished ones across them all.
+ * It fails as a whole only when no machine answered.
+ */
+export function mergedSnapshotOf(
+  answers: HostAnswer[],
+  now: number,
+  recent = 20,
+): BusSnapshot {
+  const tasks = answers.flatMap(answer =>
+    (answer.status?.tasks ?? []).map(task => ({ ...task, host: answer.host })),
+  )
+
+  const active = tasks.filter(task => ACTIVE_STATES.includes(task.state))
+
+  const finished = tasks
+    .filter(task => !ACTIVE_STATES.includes(task.state))
+    .sort((a, b) => (b.finished_at ?? 0) - (a.finished_at ?? 0))
+    .slice(0, recent)
+
+  const count = (state: BusTask['state']) =>
+    tasks.filter(task => task.state === state).length
+
+  const failed = answers.filter(answer => answer.error !== null)
+
+  return {
+    hosts: answers.map(({ host, error }) => ({ name: host, error })),
+    now,
+    counts: {
+      queued: count('queued'),
+      running: count('running'),
+      done: count('done'),
+      failed: count('failed'),
+    },
+    tasks: [...active, ...finished],
+    error:
+      answers.length > 0 && failed.length === answers.length
+        ? (failed[0]?.error ?? null)
+        : null,
+  }
 }
 
 export const ACTIVE_STATES: readonly BusTask['state'][] = [
@@ -182,8 +304,8 @@ export function runSecondsOf(task: BusTask, now: number): number | null {
  * A list row's right edge: the lane and, while active, how long it has run;
  * once finished, how long ago.
  */
-export function tailOf(task: BusTask, now: number): string {
-  const lane = laneOf(task)
+export function tailOf(task: BusTask, now: number, isTagged = false): string {
+  const lane = isTagged ? `${task.host} · ${laneOf(task)}` : laneOf(task)
 
   if (task.state === 'queued') return `${lane} · queued`
   if (task.state === 'orphaned') return `${lane} · stranded`
@@ -274,9 +396,13 @@ export function finishedNoteOf(task: BusTask): string {
     .filter(part => part)
     .join(', ')
 
+  const isRemote = task.host !== LOCAL
+
   const lines = [
-    `[agent-bus] Task \`${task.id}\` that this session dispatched ${verb} (${how}).`,
-    `Result: ${task.result}`,
+    `[agent-bus] Task \`${task.id}\` that this session dispatched ${verb} (${how}${isRemote ? `, on ${task.host}` : ''}).`,
+    isRemote
+      ? `Result on ${task.host}: read it with \`ssh ${task.host} '${REMOTE_DISPATCH} result ${task.id}'\``
+      : `Result: ${task.result}`,
   ]
 
   if (task.note) lines.push(`Dispatcher note: ${task.note.split('\n')[0]}`)

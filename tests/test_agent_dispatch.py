@@ -267,6 +267,17 @@ class DispatchTests(unittest.TestCase):
         from argparse import Namespace
         self.assertEqual(ad.cmd_cancel(Namespace(id="nope", wait=1)), 1)
 
+    def test_result_prints_text_or_fails(self):
+        from argparse import Namespace
+        import io, contextlib
+        ad.write_task({"id": "r", "to": "codex", "result": str(ad.DONE / "r.md")}, ad.DONE)
+        (ad.DONE / "r.md").write_text("# hello")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(ad.cmd_result(Namespace(id="r", max_bytes=1000)), 0)
+        self.assertEqual(out.getvalue(), "# hello")
+        self.assertEqual(ad.cmd_result(Namespace(id="missing", max_bytes=1000)), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

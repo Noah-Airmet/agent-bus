@@ -4,6 +4,7 @@ import * as Words from '../hooks/words'
 import type { BusTask } from '../types'
 
 const task = (overrides: Partial<BusTask>): BusTask => ({
+  host: 'local',
   id: 'w4-verify',
   state: 'done',
   to: 'codex',
@@ -60,6 +61,7 @@ describe('words', () => {
 
   test('the status line names the running lanes and is empty while idle', () => {
     const snapshot = (tasks: BusTask[]) => ({
+      hosts: [{ name: 'local', error: null }],
       now: 2_000,
       counts: { queued: 0, running: 0, done: 0, failed: 0 },
       tasks,
@@ -82,15 +84,56 @@ describe('words', () => {
   test('a submit needs a lane, a folder and a prompt', () => {
     const form = { lane: 'luna', mode: 'read-only', cwd: '/work', prompt: '  go  ' }
 
-    expect(Words.submitArgvOf('ad', form, 'id')).toEqual([
-      'ad', 'submit', '--to', 'codex', '--model', 'gpt-6-luna', '--effort', 'high',
+    expect(Words.submitArgsOf(form, 'id')).toEqual([
+      'submit', '--to', 'codex', '--model', 'gpt-6-luna', '--effort', 'high',
       '--mode', 'read-only', '--cwd', '/work', '--id', 'id', '--bg', 'go',
     ])
-    expect(Words.submitArgvOf('ad', { ...form, prompt: ' ' }, 'id')).toBeNull()
-    expect(Words.submitArgvOf('ad', { ...form, lane: 'opus' }, 'id')).toBeNull()
+    expect(Words.submitArgsOf({ ...form, prompt: ' ' }, 'id')).toBeNull()
+    expect(Words.submitArgsOf({ ...form, lane: 'opus' }, 'id')).toBeNull()
     expect(Words.taskIdOf('Fix the  hymn #12 tempo!', new Date(2026, 9, 1, 15, 4, 5))).toBe(
       '20261001-150405-fix-the-hymn-12-tempo',
     )
+  })
+
+  test('a remote note says which machine holds the result and how to read it', () => {
+    expect(Words.finishedNoteOf(task({ host: 'imac' }))).toBe(
+      '[agent-bus] Task `w4-verify` that this session dispatched finished ' +
+        '(codex, gpt-6-luna, 12m 4s, on imac).\n' +
+        "Result on imac: read it with `ssh imac '~/.local/bin/agent-dispatch result w4-verify'`",
+    )
+  })
+
+  test('hosts are parsed in order, once, and only as ssh aliases', () => {
+    expect(Words.hostsOf(undefined)).toEqual(['local'])
+    expect(Words.hostsOf('')).toEqual(['local'])
+    expect(Words.hostsOf('local, imac,mini imac')).toEqual(['local', 'imac', 'mini'])
+    expect(Words.hostsOf('imac;, -oProxyCommand=x, $(id), mini')).toEqual(['mini'])
+  })
+
+  test('a word is quoted for a remote shell, quotes and dollars intact', () => {
+    expect(Words.shellQuote("it's $HOME")).toBe("'it'\\''s $HOME'")
+    expect(Words.remoteCommandOf(['result', 'a b'], "o'k")).toBe(
+      "env AGENT_BUS_ORIGIN='o'\\''k' ~/.local/bin/agent-dispatch 'result' 'a b'",
+    )
+  })
+
+  test('machines merge active first, then the newest finished, failing whole only when all fail', () => {
+    const merged = Words.mergedSnapshotOf(
+      [
+        { host: 'local', status: { tasks: [task({ id: 'old', finished_at: 1 }), task({ id: 'run', state: 'running' })] }, error: null },
+        { host: 'imac', status: { tasks: [task({ id: 'new', finished_at: 9 })] }, error: null },
+        { host: 'mini', status: null, error: 'down' },
+      ],
+      10,
+    )
+
+    expect(merged.tasks.map(Words.taskKeyOf)).toEqual(['local/run', 'imac/new', 'local/old'])
+    expect(merged.error).toBeNull()
+    expect(merged.counts.running).toBe(1)
+
+    const down = Words.mergedSnapshotOf([{ host: 'imac', status: null, error: 'down' }], 10)
+
+    expect(down.error).toBe('down')
   })
 
   test('an ask is cut by whole lines to the room left', () => {

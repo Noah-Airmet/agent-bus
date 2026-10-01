@@ -100,6 +100,7 @@ agent-dispatch submit --to cursor --mode write --cwd <project> \
 # Inspect queues
 agent-dispatch status
 agent-dispatch status --json   # queued, running and recent tasks; what the Claude Code pane reads
+agent-dispatch result <id>     # a task's result text
 agent-dispatch list done
 
 # Stop a queued or running task

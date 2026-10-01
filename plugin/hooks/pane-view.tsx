@@ -5,6 +5,7 @@ import {
   homeFolded,
   isActive,
   LANES,
+  LOCAL,
   MODES,
   longSpanOf,
   markOf,
@@ -12,6 +13,7 @@ import {
   sanitize,
   spanOf,
   tailOf,
+  taskKeyOf,
   tokensOf,
 } from './words'
 
@@ -32,6 +34,7 @@ export type PaneActions = {
   toggleAsk: (id: string) => void
   compose: () => void
   discard: () => void
+  setHost: (host: string) => void
   setLane: (lane: string) => void
   setMode: (mode: string) => void
   setCwd: (cwd: string) => void
@@ -71,8 +74,8 @@ const RECENT_ROWS_DOCKED = 8
 const RECENT_ROWS_INLINE = 3
 
 /**
- * The task the detail shows: the one picked, else the first active, else
- * the most recent.
+ * The task the detail shows: the one picked (by its key across machines),
+ * else the first active, else the most recent.
  */
 export function selectedOf(
   snapshot: BusSnapshot | null,
@@ -81,7 +84,7 @@ export function selectedOf(
   const tasks = snapshot?.tasks ?? []
 
   return (
-    tasks.find(task => task.id === selected) ??
+    tasks.find(task => taskKeyOf(task) === selected) ??
     tasks.find(isActive) ??
     tasks[0] ??
     null
@@ -138,7 +141,9 @@ function headerView(
               : '',
           ]
 
-  return (
+  const unreachable = snapshot.hosts.filter(host => host.error !== null)
+
+  const line = (
     <Box flexDirection="row" height={1}>
       <Text wrap="truncate-end">
         <Text bold>{lead}</Text>
@@ -152,6 +157,19 @@ function headerView(
       ) : null}
     </Box>
   )
+
+  return unreachable.length === 0 ? (
+    line
+  ) : (
+    <Box flexDirection="column">
+      {line}
+      {unreachable.map(host => (
+        <Text color="warning" wrap="truncate-end">
+          {`Couldn't reach ${host.name}`}
+        </Text>
+      ))}
+    </Box>
+  )
 }
 
 /**
@@ -163,24 +181,26 @@ function taskRow(
   task: BusTask,
   now: number,
   isSelected: boolean,
+  isTagged: boolean,
 ): RenderElement {
   const { Box, Text, Button } = kit.ui
   const mark = markOf(task)
+  const key = taskKeyOf(task)
 
   return (
-    <Box flexDirection="row" key={`row-${task.id}`}>
+    <Box flexDirection="row" key={`row-${key}`}>
       <Text>{isSelected ? '❯ ' : '  '}</Text>
       <Text color={mark.color}>{`${mark.glyph} `}</Text>
       <Button
-        key={`task-${task.id}`}
+        key={`task-${key}`}
         plain
         dimColor={!isSelected && !isActive(task)}
-        onPress={() => kit.actions.select(task.id)}
+        onPress={() => kit.actions.select(key)}
       >
         {sanitize(task.id)}
       </Button>
       <Box flexGrow={1} />
-      <Text dimColor wrap="truncate-start">{` ${tailOf(task, now)}`}</Text>
+      <Text dimColor wrap="truncate-start">{` ${tailOf(task, now, isTagged)}`}</Text>
     </Box>
   )
 }
@@ -192,14 +212,15 @@ function taskRow(
 function detailView(kit: Kit, model: PaneModel, task: BusTask): RenderElement {
   const { Box, Text, Button, Markdown } = kit.ui
   const now = model.snapshot?.now ?? 0
-  const isArmed = model.armed === task.id
+  const key = taskKeyOf(task)
+  const isArmed = model.armed === key
 
   const action = isActive(task) ? (
-    <Button key="cancel" hotkey="c" onPress={() => kit.actions.cancel(task.id)}>
+    <Button key="cancel" hotkey="c" onPress={() => kit.actions.cancel(key)}>
       Cancel
     </Button>
   ) : (
-    <Button key="ask" hotkey="a" onPress={() => kit.actions.toggleAsk(task.id)}>
+    <Button key="ask" hotkey="a" onPress={() => kit.actions.toggleAsk(key)}>
       {isArmed ? 'Asked ✓' : 'Ask'}
     </Button>
   )
@@ -222,10 +243,15 @@ function detailView(kit: Kit, model: PaneModel, task: BusTask): RenderElement {
     .filter(part => part)
     .join(' · ')
 
-  const where = task.worktree ?? task.cwd
+  const folder = task.worktree ?? task.cwd
+
+  const where =
+    task.host === LOCAL
+      ? folder && homeFolded(folder, kit.home)
+      : [task.host, folder].filter(part => part).join(' · ')
 
   const body =
-    model.detail?.id === task.id && model.detail.text !== null ? (
+    model.detail?.id === key && model.detail.text !== null ? (
       <Markdown key="result" text={model.detail.text} />
     ) : isActive(task) ? (
       <Text wrap="wrap">{sanitize(task.prompt)}</Text>
@@ -244,7 +270,7 @@ function detailView(kit: Kit, model: PaneModel, task: BusTask): RenderElement {
           {action}
         </Box>,
         dimNote(kit, how),
-        where ? dimNote(kit, homeFolded(where, kit.home)) : null,
+        where ? dimNote(kit, where) : null,
         when ? dimNote(kit, when) : null,
         task.note ? (
           <Text color={task.cancelled ? 'inactive' : 'error'} wrap="wrap">
@@ -263,13 +289,18 @@ function detailView(kit: Kit, model: PaneModel, task: BusTask): RenderElement {
  * The new-task form in the detail's place: lane, mode, folder, then the
  * prompt, whose Enter dispatches in the background.
  */
-function composerView(kit: Kit, composer: BusComposer): RenderElement {
+function composerView(
+  kit: Kit,
+  composer: BusComposer,
+  hosts: string[],
+): RenderElement {
   const { Box, Text, Button, Input, Select } = kit.ui
   const lane = LANES.find(one => one.value === composer.lane)
 
   const hint = composer.isSending
     ? 'Dispatching…'
-    : `Enter dispatches to ${lane?.value ?? composer.lane}, ${composer.mode}`
+    : `Enter dispatches to ${lane?.value ?? composer.lane}, ${composer.mode}` +
+      (hosts.length > 1 || composer.host !== LOCAL ? `, on ${composer.host}` : '')
 
   return (
     <Box flexDirection="column">
@@ -281,6 +312,18 @@ function composerView(kit: Kit, composer: BusComposer): RenderElement {
         </Button>
       </Box>
       <Box height={1} />
+      {hosts.length > 1 ? (
+        <Select
+          key="host"
+          label="Machine "
+          value={composer.host}
+          options={hosts.map(host => ({
+            value: host,
+            label: host === LOCAL ? 'this machine' : host,
+          }))}
+          onSelect={kit.actions.setHost}
+        />
+      ) : null}
       <Select
         key="lane"
         label="Lane "
@@ -298,7 +341,11 @@ function composerView(kit: Kit, composer: BusComposer): RenderElement {
       <Input
         key="cwd"
         label="Folder "
-        value={homeFolded(composer.cwd, kit.home)}
+        value={
+          composer.host === LOCAL
+            ? homeFolded(composer.cwd, kit.home)
+            : composer.cwd
+        }
         onInput={kit.actions.setCwd}
         onSubmit={kit.actions.setCwd}
       />
@@ -346,6 +393,8 @@ export function paneView(kit: Kit, model: PaneModel): RenderElement {
     return frame([dimNote(kit, snapshot.error)])
   }
 
+  const hosts = snapshot.hosts.map(host => host.name)
+  const isTagged = hosts.length > 1
   const isComposing = model.isDocked && model.composer?.isOpen === true
   const isComposable = model.isDocked && kit.canCompose && !isComposing
 
@@ -355,7 +404,7 @@ export function paneView(kit: Kit, model: PaneModel): RenderElement {
         headerView(kit, snapshot, isComposable),
         <Box height={1} />,
         isComposing && model.composer
-          ? composerView(kit, model.composer)
+          ? composerView(kit, model.composer, hosts)
           : dimNote(kit, 'No bus tasks yet.'),
       ]),
     )
@@ -370,7 +419,13 @@ export function paneView(kit: Kit, model: PaneModel): RenderElement {
 
   const rowsOf = (tasks: BusTask[]): RenderElement[] =>
     tasks.map(task =>
-      taskRow(kit, task, snapshot.now, model.isDocked && task === selected),
+      taskRow(
+        kit,
+        task,
+        snapshot.now,
+        model.isDocked && task === selected,
+        isTagged,
+      ),
     )
 
   return frame(
@@ -382,7 +437,11 @@ export function paneView(kit: Kit, model: PaneModel): RenderElement {
       recent.length > 0 ? dimNote(kit, 'Recent') : null,
       ...rowsOf(recent),
       ...(isComposing && model.composer
-        ? [<Box height={1} />, divider(kit), composerView(kit, model.composer)]
+        ? [
+            <Box height={1} />,
+            divider(kit),
+            composerView(kit, model.composer, hosts),
+          ]
         : model.isDocked && selected
           ? [
               <Box height={1} />,

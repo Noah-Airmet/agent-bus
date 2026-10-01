@@ -2,6 +2,11 @@
  * One task as `agent-dispatch status --json` reports it (contract version 1).
  */
 export type BusTask = {
+  /**
+   * The machine whose bus holds the task: `local`, or the ssh alias the
+   * pane reached it by. Set by the pane, not the bus.
+   */
+  host: string
   id: string
   state: 'queued' | 'running' | 'orphaned' | 'done' | 'failed'
   to: string
@@ -30,6 +35,10 @@ export type BusTask = {
  * when it was taken (epoch seconds); or why the poll failed.
  */
 export type BusSnapshot = {
+  /**
+   * Every machine the pane watches, in order, and why it could not be read.
+   */
+  hosts: { name: string; error: string | null }[]
   now: number
   counts: { queued: number; running: number; done: number; failed: number }
   tasks: BusTask[]
@@ -51,6 +60,7 @@ export type BusDetail = {
  */
 export type BusComposer = {
   isOpen: boolean
+  host: string
   lane: string
   mode: 'read-only' | 'write'
   cwd: string

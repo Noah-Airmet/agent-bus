@@ -1238,6 +1238,30 @@ def cmd_cancel(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_result(args: argparse.Namespace) -> int:
+    """Print one task's result text, so a pane on another machine can read
+    it over ssh without knowing the queue layout."""
+    ensure_bus()
+    for directory in (DONE, FAILED, RUNNING, INBOX):
+        path = directory / f"{args.id}.json"
+        if path.exists():
+            break
+    else:
+        print(f"No task {args.id}", file=sys.stderr)
+        return 1
+    try:
+        task = load_task(path)
+    except Exception:
+        task = {}
+    result = Path(task.get("result") or str(DONE / f"{args.id}.md")).expanduser()
+    if not result.exists():
+        print(f"No result yet for {args.id}", file=sys.stderr)
+        return 1
+    text = read_optional(result, args.max_bytes)
+    sys.stdout.write(text)
+    return 0
+
+
 def cmd_workers(_args: argparse.Namespace) -> int:
     """Show which worker CLIs are installed and usable. For setup checks."""
     for name in sorted(AGENT_COMMANDS):
@@ -1307,6 +1331,11 @@ def main() -> int:
     status.add_argument("--recent", type=int, default=20,
                         help="With --json, how many finished tasks to include.")
     status.set_defaults(func=cmd_status)
+
+    result = sub.add_parser("result", help="Print a task's result text.")
+    result.add_argument("id")
+    result.add_argument("--max-bytes", type=int, default=200000)
+    result.set_defaults(func=cmd_result)
 
     cancel = sub.add_parser("cancel", help="Stop a queued or running task.")
     cancel.add_argument("id")

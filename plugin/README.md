@@ -27,6 +27,33 @@ if it was left open.
 Nothing narrates the pane: the rows, the marks (`●` running, `○` queued,
 `✓` done, `✗` failed, `⊘` cancelled, `!` stranded) and the detail carry it.
 
+## Machines
+
+The `hosts` option lists the buses the pane watches, in order: `local` for
+this machine's, or an ssh alias for another's. It defaults to `local`.
+
+```sh
+echo '{"hosts":"imac"}' | claude plugin configure agent-bus@agent-bus --values-stdin
+```
+
+- **A machine with no bus** (a laptop) lists the machines that have one,
+  e.g. `imac`, or `mini, imac`.
+- **A machine with its own bus** lists `local` first, e.g. `local, imac`.
+- **Watching more than one machine:** each row gets a dim machine tag, a
+  machine that can't be reached gets a warning line under the header, and
+  New task gains a Machine picker. The first machine is the default.
+- **Folders:** each machine remembers the folder last dispatched to there.
+  Another machine's folder starts at `~` and is its own path, not this one's.
+- **Completion reports:** a task finishing on another machine still reports
+  to the session that dispatched it, because the origin is the session's id.
+
+Another machine is reached as `ssh <alias> '~/.local/bin/agent-dispatch …'`:
+BatchMode so it never prompts, a 5 s connect timeout, and one shared
+connection (`ControlPersist`). Every argument is single-quoted for the remote
+shell. Only names made of letters, digits, `.`, `_` and `-`, not starting
+with `-`, count as aliases. The other machine needs the bus installed and
+this machine's key in its `authorized_keys`.
+
 ## How it reads the bus
 
 Only through `agent-dispatch`, never the queue files directly:
@@ -34,15 +61,18 @@ Only through `agent-dispatch`, never the queue files directly:
 - `agent-dispatch status --json --recent 20` (contract version 1) gives the
   snapshot.
 - `agent-dispatch cancel <id>` stops a task.
+- `agent-dispatch result <id>` gives a finished task's result text (for the
+  detail and for Ask).
 - `agent-dispatch submit … --bg` with `AGENT_BUS_ORIGIN` set to the
   session's id dispatches the form.
 - `agent-dispatch submit` stamps each task with the submitting session's id
   (`CLAUDE_CODE_SESSION_ID`, or `AGENT_BUS_ORIGIN`), which is how a
   completion finds its way home.
 
-Every 2 s the mod compares the queue folders' modification times and asks
-the bus again only when one changed. While a task runs it also asks every
-15 s, so elapsed times move.
+Every 2 s the mod compares this machine's queue folders' modification times
+and asks the bus again only when one changed. Another machine's bus is asked
+every 5 s, since there is no folder to watch over ssh. While a task runs, the
+bus is also asked every 15 s, so elapsed times move.
 
 ## What it hooks
 
@@ -57,8 +87,8 @@ the bus again only when one changed. While a task runs it also asks every
 ## What it calls on `$`
 
 `clock.every`, `clock.now`, `command.register`, `env.get` (`HOME`,
-`AGENT_BUS_HOME`), `fs.exists`, `fs.read`, `fs.stat`, `process.run`
-(`agent-dispatch` only), `session.append`, `session.id`, `state.get`,
+`AGENT_BUS_HOME`), `fs.exists`, `fs.stat`, `process.run` (`agent-dispatch`,
+or `ssh <alias>` running it), `session.append`, `session.id`, `state.get`,
 `state.set`, `store.get`, `store.set`, `ui.close`, `ui.open`, `ui.panes`,
 `ui.resolve`, `ui.status`, `ui.toast`.
 
