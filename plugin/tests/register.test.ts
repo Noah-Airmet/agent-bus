@@ -82,7 +82,7 @@ const BUS: Args<'command.run'> = {
  * folders change when `stamp` moves, and which keeps what the plugin shows.
  */
 function world(on: On, tasks: () => BusTask[]) {
-  const runs: string[][] = []
+  const runs: { argv: string[]; env?: Record<string, string> }[] = []
   const toasts: string[] = []
   const statuses: (string | undefined)[] = []
   const panes: { id: string; title: string; isActive: boolean }[] = []
@@ -102,14 +102,14 @@ function world(on: On, tasks: () => BusTask[]) {
   on('fs.read', ($, e) => ({ value: `# Result of ${e.path}\n\nAll good.` }))
 
   on('process.run', ($, e) => {
-    runs.push([...e.argv])
+    runs.push({ argv: [...e.argv], env: e.init?.env })
 
     const isStatus = e.argv.includes('status')
 
     return {
       value: {
         exitCode: 0,
-        stdout: isStatus ? snapshotOf(tasks()) : `cancelled: ${e.argv[2]}`,
+        stdout: isStatus ? snapshotOf(tasks()) : `${e.argv[2]}`,
         stderr: '',
       },
     }
@@ -235,6 +235,56 @@ describe('register', () => {
     expect(await $.command.run(BUS)).toEqual({ text: 'Bus panel hidden' })
     expect(bus.panes).toEqual([])
   })
+
+  for (const surface of ['terminal', 'desktop'] as const) {
+    test(`a new task from the ${surface} pane dispatches in the lane picked, under this session`, async ($, on) => {
+      const bus = world(on, () => [FINISHED])
+
+      await $.session.start({ surface, isInteractive: true, cwd: '/home/me/development/hymns' })
+      await bus.clock.advance(100)
+
+      const ui = await $.ui.mount({
+        plugin: 'agent-bus',
+        surface,
+        component: 'Pane',
+        props: pane(surface).props,
+        requestId: 'bus',
+      })
+
+      await ui.press({ key: 'compose' })
+      await ui.select({ key: 'lane', value: 'sol' })
+      await ui.select({ key: 'mode', value: 'write' })
+      await ui.input({ key: 'prompt', text: 'Add a tempo slider', kind: 'change' })
+      await ui.input({ key: 'prompt', text: 'Add a tempo slider' })
+      await bus.clock.advance(100)
+
+      const submit = bus.runs.find(run => run.argv.includes('submit'))
+
+      expect(submit?.argv.slice(1)).toEqual([
+        'submit',
+        '--to',
+        'codex',
+        '--model',
+        'gpt-6.1-sol',
+        '--effort',
+        'medium',
+        '--mode',
+        'write',
+        '--cwd',
+        '/home/me/development/hymns',
+        '--scope',
+        'files under /home/me/development/hymns only',
+        '--id',
+        expect.stringMatching(/^\d{8}-\d{6}-add-a-tempo-slider$/),
+        '--bg',
+        'Add a tempo slider',
+      ])
+      expect(submit?.env).toEqual({ AGENT_BUS_ORIGIN: SESSION_ID })
+      expect(bus.toasts.at(-1)).toMatch(/^Dispatched \d{8}-\d{6}-add-a-tempo-slider to sol$/)
+
+      await ui.unmount()
+    })
+  }
 
   test('an idle bus with no history says so', async ($, on) => {
     const bus = world(on, () => [])

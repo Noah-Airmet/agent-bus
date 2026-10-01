@@ -79,6 +79,20 @@ describe('words', () => {
     ).toBe('bus · 2 running (luna, sol) · 1 queued')
   })
 
+  test('a submit needs a lane, a folder and a prompt', () => {
+    const form = { lane: 'luna', mode: 'read-only', cwd: '/work', prompt: '  go  ' }
+
+    expect(Words.submitArgvOf('ad', form, 'id')).toEqual([
+      'ad', 'submit', '--to', 'codex', '--model', 'gpt-6-luna', '--effort', 'high',
+      '--mode', 'read-only', '--cwd', '/work', '--id', 'id', '--bg', 'go',
+    ])
+    expect(Words.submitArgvOf('ad', { ...form, prompt: ' ' }, 'id')).toBeNull()
+    expect(Words.submitArgvOf('ad', { ...form, lane: 'opus' }, 'id')).toBeNull()
+    expect(Words.taskIdOf('Fix the  hymn #12 tempo!', new Date(2026, 9, 1, 15, 4, 5))).toBe(
+      '20261001-150405-fix-the-hymn-12-tempo',
+    )
+  })
+
   test('an ask is cut by whole lines to the room left', () => {
     const body = Array.from({ length: 50 }, (_, n) => `line ${n}`).join('\n')
     const whole = Words.askTextOf(task({}), body, 10_000)

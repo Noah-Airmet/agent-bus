@@ -45,6 +45,19 @@ export type BusDetail = {
   text: string | null
 }
 
+/**
+ * The new-task form under the list: which lane, whether the worker may
+ * write, where it runs, and the prompt typed so far.
+ */
+export type BusComposer = {
+  isOpen: boolean
+  lane: string
+  mode: 'read-only' | 'write'
+  cwd: string
+  prompt: string
+  isSending: boolean
+}
+
 declare module 'claude-code' {
   interface PluginState {
     'agent-bus': {
@@ -52,6 +65,7 @@ declare module 'claude-code' {
       selected: string | null
       detail: BusDetail | null
       armed: string | null
+      composer: BusComposer | null
     }
   }
 }

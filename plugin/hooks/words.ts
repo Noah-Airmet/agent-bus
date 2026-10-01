@@ -33,6 +33,87 @@ export const PROMPT_CONTEXT_MAX_CHARS = 32_000
  */
 export const DETAIL_MAX_CHARS = 9_000
 
+/**
+ * The lanes the form dispatches to, as agent-ops ROUTING.md names them:
+ * each one's `agent-dispatch submit` arguments.
+ */
+export const LANES: readonly { value: string; label: string; argv: string[] }[] =
+  [
+    {
+      value: 'luna',
+      label: 'luna · throughput',
+      argv: ['--to', 'codex', '--model', 'gpt-6-luna', '--effort', 'high'],
+    },
+    {
+      value: 'sol',
+      label: 'sol · implementation',
+      argv: ['--to', 'codex', '--model', 'gpt-6.1-sol', '--effort', 'medium'],
+    },
+    {
+      value: 'sonnet',
+      label: 'sonnet · fallback',
+      argv: ['--to', 'claude', '--effort', 'medium'],
+    },
+  ]
+
+export const MODES = [
+  { value: 'read-only', label: 'read-only' },
+  { value: 'write', label: 'may edit files' },
+] as const
+
+/**
+ * The id a task dispatched from the pane is queued under: the time and the
+ * prompt's first words, as agent-dispatch names one itself.
+ */
+export function taskIdOf(prompt: string, at: Date): string {
+  const pad = (n: number) => String(n).padStart(2, '0')
+
+  const stamp =
+    `${at.getFullYear()}${pad(at.getMonth() + 1)}${pad(at.getDate())}-` +
+    `${pad(at.getHours())}${pad(at.getMinutes())}${pad(at.getSeconds())}`
+
+  const slug = prompt
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 40)
+    .replace(/-+$/g, '')
+
+  return `${stamp}-${slug || 'task'}`
+}
+
+/**
+ * The argument vector that submits the form, run in the background so the
+ * call returns at once; the folder bounds a writing task's scope.
+ */
+export function submitArgvOf(
+  dispatch: string,
+  composer: { lane: string; mode: string; cwd: string; prompt: string },
+  id: string,
+): string[] | null {
+  const lane = LANES.find(one => one.value === composer.lane)
+  const prompt = composer.prompt.trim()
+
+  if (!lane || !prompt || !composer.cwd.trim()) return null
+
+  return [
+    dispatch,
+    'submit',
+    ...lane.argv,
+    '--mode',
+    composer.mode,
+    '--cwd',
+    composer.cwd.trim(),
+    ...(composer.mode === 'write'
+      ? ['--scope', `files under ${composer.cwd.trim()} only`]
+      : []),
+    '--id',
+    id,
+    '--bg',
+    prompt,
+  ]
+}
+
 export const ACTIVE_STATES: readonly BusTask['state'][] = [
   'running',
   'queued',

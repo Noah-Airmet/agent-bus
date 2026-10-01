@@ -12,6 +12,11 @@ if it was left open.
 - **Finished tasks:** each row shows how long ago it finished. The detail
   renders the result file as Markdown, with **Ask** (`a`), which attaches that
   result to your next prompt once, the way `/diff`'s ask attaches hunks.
+- **New task** (`n`, docked): a form in the detail's place. Pick a lane
+  (luna, sol or sonnet, as agent-ops `ROUTING.md` names them), read-only or
+  may-edit, and a folder (the session's by default), then type the prompt;
+  Enter dispatches it in the background under this session, selects it in
+  the list, and its finish reports back here.
 - **Status line:** while anything runs it reads
   `bus · 2 running (luna, sol) · 1 queued`. It clears once the bus is idle.
 - **Completion:** when a task finishes, a toast says so in the session that
@@ -29,6 +34,8 @@ Only through `agent-dispatch`, never the queue files directly:
 - `agent-dispatch status --json --recent 20` (contract version 1) gives the
   snapshot.
 - `agent-dispatch cancel <id>` stops a task.
+- `agent-dispatch submit … --bg` with `AGENT_BUS_ORIGIN` set to the
+  session's id dispatches the form.
 - `agent-dispatch submit` stamps each task with the submitting session's id
   (`CLAUDE_CODE_SESSION_ID`, or `AGENT_BUS_ORIGIN`), which is how a
   completion finds its way home.

@@ -1,9 +1,11 @@
 import type { ElementTable, RenderElement } from 'claude-code'
 
-import type { BusDetail, BusSnapshot, BusTask } from '../types'
+import type { BusComposer, BusDetail, BusSnapshot, BusTask } from '../types'
 import {
   homeFolded,
   isActive,
+  LANES,
+  MODES,
   longSpanOf,
   markOf,
   runSecondsOf,
@@ -18,7 +20,7 @@ import {
  */
 export type Ui = Pick<
   ElementTable<'terminal' | 'desktop'>,
-  'Box' | 'Text' | 'Button' | 'Markdown'
+  'Box' | 'Text' | 'Button' | 'Markdown' | 'Input' | 'Select'
 >
 
 /**
@@ -28,6 +30,13 @@ export type PaneActions = {
   select: (id: string) => void
   cancel: (id: string) => void
   toggleAsk: (id: string) => void
+  compose: () => void
+  discard: () => void
+  setLane: (lane: string) => void
+  setMode: (mode: string) => void
+  setCwd: (cwd: string) => void
+  setPrompt: (prompt: string) => void
+  dispatch: (prompt: string) => void
 }
 
 /**
@@ -38,6 +47,12 @@ export type Kit = {
   actions: PaneActions
   columns: number
   home: string | undefined
+
+  /**
+   * Whether the surface draws text fields (the mobile app does not), so the
+   * pane offers a new task there.
+   */
+  canCompose: boolean
 }
 
 export type PaneModel = {
@@ -45,6 +60,7 @@ export type PaneModel = {
   selected: string | null
   detail: BusDetail | null
   armed: string | null
+  composer: BusComposer | null
   isDocked: boolean
 }
 
@@ -99,8 +115,12 @@ function divider(kit: Kit): RenderElement {
  * The first line: what is running and queued in bold, or `Idle` and when the
  * bus last finished something.
  */
-function headerView(kit: Kit, snapshot: BusSnapshot): RenderElement {
-  const { Box, Text } = kit.ui
+function headerView(
+  kit: Kit,
+  snapshot: BusSnapshot,
+  isComposable: boolean,
+): RenderElement {
+  const { Box, Text, Button } = kit.ui
   const tasks = snapshot.tasks
   const running = tasks.filter(task => task.state === 'running').length
   const queued = tasks.filter(task => task.state === 'queued').length
@@ -124,6 +144,12 @@ function headerView(kit: Kit, snapshot: BusSnapshot): RenderElement {
         <Text bold>{lead}</Text>
         <Text dimColor>{aside}</Text>
       </Text>
+      <Box flexGrow={1} />
+      {isComposable ? (
+        <Button key="compose" plain dimColor hotkey="n" onPress={kit.actions.compose}>
+          New task
+        </Button>
+      ) : null}
     </Box>
   )
 }
@@ -234,6 +260,66 @@ function detailView(kit: Kit, model: PaneModel, task: BusTask): RenderElement {
 }
 
 /**
+ * The new-task form in the detail's place: lane, mode, folder, then the
+ * prompt, whose Enter dispatches in the background.
+ */
+function composerView(kit: Kit, composer: BusComposer): RenderElement {
+  const { Box, Text, Button, Input, Select } = kit.ui
+  const lane = LANES.find(one => one.value === composer.lane)
+
+  const hint = composer.isSending
+    ? 'Dispatching…'
+    : `Enter dispatches to ${lane?.value ?? composer.lane}, ${composer.mode}`
+
+  return (
+    <Box flexDirection="column">
+      <Box flexDirection="row" height={1}>
+        <Text bold>New task</Text>
+        <Box flexGrow={1} />
+        <Button key="discard" role="dismiss" onPress={kit.actions.discard}>
+          Discard
+        </Button>
+      </Box>
+      <Box height={1} />
+      <Select
+        key="lane"
+        label="Lane "
+        value={composer.lane}
+        options={LANES.map(({ value, label }) => ({ value, label }))}
+        onSelect={kit.actions.setLane}
+      />
+      <Select
+        key="mode"
+        label="Mode "
+        value={composer.mode}
+        options={MODES.map(({ value, label }) => ({ value, label }))}
+        onSelect={kit.actions.setMode}
+      />
+      <Input
+        key="cwd"
+        label="Folder "
+        value={homeFolded(composer.cwd, kit.home)}
+        onInput={kit.actions.setCwd}
+        onSubmit={kit.actions.setCwd}
+      />
+      <Box height={1} />
+      <Input
+        key="prompt"
+        label="Prompt "
+        placeholder="What should the worker do?"
+        submitLabel="dispatch"
+        value={composer.prompt}
+        autoFocus
+        onInput={kit.actions.setPrompt}
+        onSubmit={kit.actions.dispatch}
+      />
+      <Box height={1} />
+      {dimNote(kit, hint)}
+    </Box>
+  )
+}
+
+/**
  * The pane's body for one `ui.render`. Docked: the header, the active
  * tasks, the recent ones, then the selected task in full. Inline above the
  * prompt: the header and the rows alone.
@@ -260,8 +346,19 @@ export function paneView(kit: Kit, model: PaneModel): RenderElement {
     return frame([dimNote(kit, snapshot.error)])
   }
 
+  const isComposing = model.isDocked && model.composer?.isOpen === true
+  const isComposable = model.isDocked && kit.canCompose && !isComposing
+
   if (snapshot.tasks.length === 0) {
-    return frame([dimNote(kit, 'No bus tasks yet.')])
+    return frame(
+      present([
+        headerView(kit, snapshot, isComposable),
+        <Box height={1} />,
+        isComposing && model.composer
+          ? composerView(kit, model.composer)
+          : dimNote(kit, 'No bus tasks yet.'),
+      ]),
+    )
   }
 
   const selected = selectedOf(snapshot, model.selected)
@@ -278,19 +375,21 @@ export function paneView(kit: Kit, model: PaneModel): RenderElement {
 
   return frame(
     present([
-      headerView(kit, snapshot),
+      headerView(kit, snapshot, isComposable),
       <Box height={1} />,
       ...rowsOf(active),
       active.length > 0 && recent.length > 0 ? <Box height={1} /> : null,
       recent.length > 0 ? dimNote(kit, 'Recent') : null,
       ...rowsOf(recent),
-      ...(model.isDocked && selected
-        ? [
-            <Box height={1} />,
-            divider(kit),
-            detailView(kit, model, selected),
-          ]
-        : []),
+      ...(isComposing && model.composer
+        ? [<Box height={1} />, divider(kit), composerView(kit, model.composer)]
+        : model.isDocked && selected
+          ? [
+              <Box height={1} />,
+              divider(kit),
+              detailView(kit, model, selected),
+            ]
+          : []),
     ]),
   )
 }

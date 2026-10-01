@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { Register } from 'claude-code'
 
-import type { BusDetail, BusSnapshot } from '../types'
+import type { BusComposer, BusDetail, BusSnapshot } from '../types'
 import { paneView, selectedOf } from './pane-view'
 import type { PaneActions, Ui } from './pane-view'
 import * as Words from './words'
@@ -13,6 +13,10 @@ const snapshotAtom = atom(
 const selectedAtom = atom({ plugin: 'agent-bus', key: 'selected' } as const, null)
 const detailAtom = atom({ plugin: 'agent-bus', key: 'detail' } as const, null)
 const armedAtom = atom({ plugin: 'agent-bus', key: 'armed' } as const, null)
+const composerAtom = atom(
+  { plugin: 'agent-bus', key: 'composer' } as const,
+  null,
+)
 
 /**
  * How often the queue folders' modification times are compared: a task
@@ -34,7 +38,11 @@ type RunResult = { exitCode: number; stdout: string; stderr: string }
  * call on the `$` that `session.start` was handed, bound there.
  */
 type Host = {
-  run: (argv: string[], timeoutMs: number) => Promise<RunResult>
+  run: (
+    argv: string[],
+    timeoutMs: number,
+    env?: Record<string, string>,
+  ) => Promise<RunResult>
   now: () => Promise<number>
   mtime: (path: string) => Promise<number>
   readFile: (path: string) => Promise<string | null>
@@ -47,6 +55,10 @@ type Host = {
   setDetail: (detail: BusDetail) => Promise<unknown>
   setSnapshot: (snapshot: BusSnapshot) => Promise<unknown>
   toggleArmed: (id: string) => Promise<unknown>
+  getComposer: () => Promise<BusComposer | null>
+  editComposer: (
+    edit: (composer: BusComposer | null) => BusComposer | null,
+  ) => Promise<unknown>
 }
 
 const firstLine = (text: string): string =>
@@ -58,6 +70,7 @@ export const register: Register = on => {
   let busHome = ''
   let dispatch = 'agent-dispatch'
   let sessionId = ''
+  let sessionCwd = ''
 
   let signature = ''
   let lastPollAt = 0
@@ -223,20 +236,110 @@ export const register: Register = on => {
       toggleAsk: id => {
         void engine.toggleArmed(id)
       },
+      compose: () => {
+        void engine.editComposer(composer => ({
+          isOpen: true,
+          lane: composer?.lane ?? 'luna',
+          mode: composer?.mode ?? 'read-only',
+          cwd: composer?.cwd ?? sessionCwd,
+          prompt: composer?.prompt ?? '',
+          isSending: false,
+        }))
+      },
+      discard: () => {
+        void engine.editComposer(
+          composer => composer && { ...composer, isOpen: false, prompt: '' },
+        )
+      },
+      setLane: lane => {
+        void engine.editComposer(composer => composer && { ...composer, lane })
+      },
+      setMode: mode => {
+        const next = mode === 'write' ? 'write' : 'read-only'
+
+        void engine.editComposer(
+          composer => composer && { ...composer, mode: next },
+        )
+      },
+      setCwd: cwd => {
+        const path = home && cwd.startsWith('~') ? home + cwd.slice(1) : cwd
+
+        void engine.editComposer(
+          composer => composer && { ...composer, cwd: path },
+        )
+      },
+      setPrompt: prompt => {
+        void engine.editComposer(composer => composer && { ...composer, prompt })
+      },
+      dispatch: prompt => {
+        void submit(engine, prompt)
+      },
     }
+  }
+
+  /**
+   * Dispatches the form in the background under this session's origin, so
+   * its finish reports here; then shows the new task and clears the form.
+   */
+  async function submit(engine: Host, prompt: string) {
+    const composer = await engine.getComposer()
+
+    if (!composer || composer.isSending) return
+
+    const id = Words.taskIdOf(prompt, new Date(await engine.now()))
+    const argv = Words.submitArgvOf(dispatch, { ...composer, prompt }, id)
+
+    if (!argv) {
+      engine.toast('Type a prompt and a folder first')
+
+      return
+    }
+
+    await engine.editComposer(
+      current => current && { ...current, prompt, isSending: true },
+    )
+
+    const run = await engine
+      .run(argv, 30_000, { AGENT_BUS_ORIGIN: sessionId })
+      .catch(() => null)
+
+    if (run === null || run.exitCode !== 0) {
+      engine.toast(
+        run === null
+          ? "Couldn't run agent-dispatch submit"
+          : firstLine(run.stderr || run.stdout),
+      )
+
+      await engine.editComposer(
+        current => current && { ...current, isSending: false },
+      )
+
+      return
+    }
+
+    engine.toast(`Dispatched ${id} to ${composer.lane}`)
+
+    await engine.editComposer(
+      current =>
+        current && { ...current, isOpen: false, prompt: '', isSending: false },
+    )
+
+    await engine.setSelected(id)
+    await poll(engine)
   }
 
   on('session.start', async ($, e, next) => {
     home = await $.env.get('HOME')
     busHome = (await $.env.get('AGENT_BUS_HOME')) ?? `${home}/.agent-bus`
     sessionId = await $.session.id()
+    sessionCwd = e.cwd
 
     const installed = `${home}/.local/bin/agent-dispatch`
 
     dispatch = (await $.fs.exists(installed)) ? installed : 'agent-dispatch'
 
     const engine: Host = {
-      run: (argv, timeoutMs) => $.process.run(argv, { timeoutMs }),
+      run: (argv, timeoutMs, env) => $.process.run(argv, { timeoutMs, env }),
       now: () => $.clock.now(),
       mtime: path =>
         $.fs
@@ -258,6 +361,8 @@ export const register: Register = on => {
       setSnapshot: snapshot => update($, snapshotAtom, () => snapshot),
       toggleArmed: id =>
         update($, armedAtom, armed => (armed === id ? null : id)),
+      getComposer: () => read($, composerAtom),
+      editComposer: edit => update($, composerAtom, edit),
     }
 
     host = engine
@@ -328,24 +433,28 @@ export const register: Register = on => {
     async ($, e, next) => {
       if (!host) return next(e)
 
-      const { Box, Text, Button, Markdown } = (await $.ui.resolve(e)) as Ui
+      const { Box, Text, Button, Markdown, Input, Select } = (await $.ui.resolve(
+        e,
+      )) as Ui
       const isDocked = e.props.placement === 'dock'
 
-      const [snapshot, selected, detail, armed] = await Promise.all([
+      const [snapshot, selected, detail, armed, composer] = await Promise.all([
         read($, snapshotAtom),
         read($, selectedAtom),
         read($, detailAtom),
         read($, armedAtom),
+        read($, composerAtom),
       ])
 
       return paneView(
         {
-          ui: { Box, Text, Button, Markdown },
+          ui: { Box, Text, Button, Markdown, Input, Select },
           actions: actionsOf(host),
           columns: Math.max(1, e.props.bodyColumns - (isDocked ? 1 : 0)),
           home,
+          canCompose: e.surface !== 'mobile',
         },
-        { snapshot, selected, detail, armed, isDocked },
+        { snapshot, selected, detail, armed, composer, isDocked },
       )
     },
   )
