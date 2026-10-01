@@ -1,2 +1,4 @@
 .DS_Store
 __pycache__/
+plugin/.claude-plugin/types/
+plugin/.claude/

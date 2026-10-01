@@ -1,0 +1,15 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "agent-bus",
+  "description": "The agent bus inside Claude Code",
+  "owner": {
+    "name": "Noah Airmet"
+  },
+  "plugins": [
+    {
+      "name": "agent-bus",
+      "description": "The agent bus beside the transcript: /bus shows queued, running and recent tasks with their results, a running count rides the status line, and a task a session dispatched reports back to it when it finishes.",
+      "source": "./plugin"
+    }
+  ]
+}

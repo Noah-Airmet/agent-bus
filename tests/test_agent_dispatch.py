@@ -219,6 +219,54 @@ class DispatchTests(unittest.TestCase):
         for key in ("finished_at", "elapsed_s", "exit_code", "agent", "model", "effort", "usage"):
             self.assertIn(key, saved)
 
+    def test_submit_records_origin_session(self):
+        from argparse import Namespace
+        args = Namespace(prompt=["hello"], prompt_file=None, id="origin-task", result=None,
+            to="codex", mode="read-only", cwd=str(self.home), scope="test", timeout=10,
+            retry=0, continuations=1, model=None, effort=None, wrap_result=False,
+            worktree=False, bg=False, run=False)
+        with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "sess-1"}, clear=False):
+            os.environ.pop("AGENT_BUS_ORIGIN", None)
+            ad.cmd_submit(args)
+        saved = json.loads((ad.INBOX / "origin-task.json").read_text())
+        self.assertEqual(saved["origin"], "sess-1")
+
+    def test_status_snapshot_lists_active_then_recent(self):
+        ad.write_task({"id": "q1", "to": "codex", "prompt": "p"})
+        ad.write_task({"id": "r1", "to": "claude", "prompt": "p", "pid": os.getpid(),
+                       "started_at": 100.0, "origin": "sess-1"}, ad.RUNNING)
+        for n, directory in enumerate((ad.DONE, ad.FAILED, ad.DONE)):
+            path = ad.write_task({"id": f"f{n}", "to": "codex", "prompt": "p",
+                                  "finished_at": "2026-10-01T12:00:00-06:00",
+                                  "usage": {"input_tokens": 10, "output_tokens": 5,
+                                            "cached_input_tokens": 99}}, directory)
+            os.utime(path, (1000 + n, 1000 + n))
+        with mock.patch.object(ad, "_pid_is_dispatcher", return_value=True):
+            snap = ad.status_snapshot(recent=2)
+        self.assertEqual([t["id"] for t in snap["tasks"]], ["q1", "r1", "f2", "f1"])
+        self.assertEqual([t["state"] for t in snap["tasks"]], ["queued", "running", "done", "failed"])
+        self.assertEqual(snap["tasks"][1]["origin"], "sess-1")
+        self.assertEqual(snap["tasks"][2]["tokens"], 15)
+        self.assertEqual(snap["counts"], {"queued": 1, "running": 1, "done": 2, "failed": 1})
+
+    def test_cancel_queued_moves_to_failed_marked(self):
+        from argparse import Namespace
+        ad.write_task({"id": "q1", "to": "codex", "prompt": "p"})
+        self.assertEqual(ad.cmd_cancel(Namespace(id="q1", wait=1)), 0)
+        saved = json.loads((ad.FAILED / "q1.json").read_text())
+        self.assertTrue(saved["cancelled"])
+        self.assertFalse((ad.INBOX / "q1.json").exists())
+
+    def test_cancel_running_with_dead_dispatcher_sweeps(self):
+        from argparse import Namespace
+        ad.write_task({"id": "r1", "to": "codex", "prompt": "p", "pid": 999999}, ad.RUNNING)
+        self.assertEqual(ad.cmd_cancel(Namespace(id="r1", wait=1)), 0)
+        self.assertTrue(json.loads((ad.FAILED / "r1.json").read_text())["cancelled"])
+
+    def test_cancel_unknown_task_fails(self):
+        from argparse import Namespace
+        self.assertEqual(ad.cmd_cancel(Namespace(id="nope", wait=1)), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

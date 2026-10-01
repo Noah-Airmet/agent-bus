@@ -1,0 +1,21 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "agent-bus",
+  "version": "0.1.0",
+  "description": "Delegate to local coding assistants and oversee their tasks through MCP.",
+  "author": {"name": "Noah Airmet"},
+  "repository": "https://github.com/noahairmet/agent-bus",
+  "license": "MIT",
+  "keywords": ["agents", "delegation", "local", "mcp"],
+  "extensions": {
+    "com.openai": {
+      "interface": {
+        "displayName": "Agent Bus",
+        "shortDescription": "Delegate to your local coding assistants",
+        "category": "Productivity",
+        "capabilities": ["Read", "Write"],
+        "defaultPrompt": ["Show my agent bus tasks.", "Delegate a read-only review to Codex."]
+      }
+    }
+  }
+}

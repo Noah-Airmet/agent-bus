@@ -45,6 +45,12 @@ echo "Worker status:"
 "$BIN_DIR/agent-dispatch" workers
 echo ""
 echo "Bus ready. Queues live in $BUS_DIR"
+if command -v claude >/dev/null 2>&1; then
+  echo ""
+  echo "Claude Code is installed: for the /bus pane, run these inside a session:"
+  echo "  /plugin marketplace add $(cd "$(dirname "$0")" && pwd)"
+  echo "  /plugin install agent-bus@agent-bus"
+fi
 
 if [ "${1:-}" = "--smoke-test" ]; then
   echo ""

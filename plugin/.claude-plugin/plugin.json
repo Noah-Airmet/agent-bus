@@ -1,0 +1,9 @@
+{
+  "name": "agent-bus",
+  "version": "0.1.0",
+  "description": "The agent bus beside the transcript: /bus opens a pane of queued, running and recent tasks with their results, a running count rides the status line, and a task this session dispatched reports back to it when it finishes.",
+  "author": {
+    "name": "Noah Airmet"
+  },
+  "types": "./types/index.d.ts"
+}

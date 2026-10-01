@@ -1,0 +1,4 @@
+{
+  "description": "The bus pane: /bus and its Pane drawing, a poll of agent-dispatch status --json, the status line's running count, completion toasts and notes for this session's own tasks, and the ask that rides a result on the next prompt",
+  "modules": ["./register.tsx"]
+}

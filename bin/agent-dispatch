@@ -161,9 +161,9 @@ def load_task(path: Path) -> dict:
             "cwd": str(HOME), "prompt": body, "scope": "unspecified"}
 
 
-def write_task(task: dict, directory: Path = INBOX) -> Path:
+def write_task(task: dict, directory: Optional[Path] = None) -> Path:
     ensure_bus()
-    path = directory / f"{task['id']}.json"
+    path = (directory or INBOX) / f"{task['id']}.json"
     with path.open("w", encoding="utf-8") as f:
         json.dump(task, f, indent=2)
         f.write("\n")
@@ -847,6 +847,96 @@ def run_route(running_path: Path, task: dict, route: str) -> int:
     return final_rc
 
 
+def submit_origin() -> Optional[str]:
+    """The session that submitted a task, so its completion can find its way
+    back there: AGENT_BUS_ORIGIN when set, else the Claude Code session id."""
+    for name in ("AGENT_BUS_ORIGIN", "CLAUDE_CODE_SESSION_ID"):
+        value = os.environ.get(name, "").strip()
+        if value:
+            return value
+    return None
+
+
+def _epoch(value) -> Optional[float]:
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str) and value:
+        try:
+            return dt.datetime.fromisoformat(value).timestamp()
+        except ValueError:
+            return None
+    return None
+
+
+def task_summary(path: Path, state: str) -> dict:
+    """One task as `status --json` reports it: the stable contract the
+    Claude Code pane reads, so it never parses queue files itself."""
+    try:
+        task = load_task(path)
+    except Exception:
+        task = {"id": path.stem}
+    usage = task.get("usage") or {}
+    tokens = sum(v for k, v in usage.items()
+                 if k.endswith("_tokens") and k != "cached_input_tokens"
+                 and isinstance(v, (int, float)))
+    started = _epoch(task.get("started_at"))
+    finished = _epoch(task.get("finished_at"))
+    if state in ("done", "failed") and finished is None:
+        finished = path.stat().st_mtime
+    log = LOGS / f"{task.get('id', path.stem)}.log"
+    note = path.parent / f"{path.stem}.note.txt"
+    return {
+        "id": task.get("id", path.stem),
+        "state": state,
+        "to": task_target(task),
+        "agent": task.get("agent") or task_target(task),
+        "model": task.get("model"),
+        "effort": task.get("effort"),
+        "mode": task.get("mode"),
+        "cwd": task.get("cwd"),
+        "prompt": (task.get("prompt") or "")[:400],
+        "origin": task.get("origin"),
+        "queued_at": path.stat().st_mtime if state == "queued" else None,
+        "started_at": started,
+        "finished_at": finished,
+        "elapsed_s": task.get("elapsed_s"),
+        "exit_code": task.get("exit_code"),
+        "cancelled": bool(task.get("cancelled")),
+        "tokens": int(tokens) or None,
+        "result": task.get("result") or str(DONE / f"{path.stem}.md"),
+        "log": str(log) if log.exists() else None,
+        "note": read_optional(note, 2000).strip() or None if note.exists() else None,
+        "worktree": task.get("worktree") if isinstance(task.get("worktree"), str) else None,
+    }
+
+
+def status_snapshot(prefix: Optional[str] = None, recent: int = 20) -> dict:
+    orphaned = {path.stem for path, _task, _reason in find_orphans(prefix)}
+    tasks = []
+    for state, directory in (("queued", INBOX), ("running", RUNNING)):
+        for path in sorted(directory.glob("*.json")):
+            if prefix and not path.stem.startswith(prefix):
+                continue
+            summary = task_summary(path, state)
+            if path.stem in orphaned:
+                summary["state"] = "orphaned"
+            tasks.append(summary)
+    finished = []
+    for state, directory in (("done", DONE), ("failed", FAILED)):
+        for path in directory.glob("*.json"):
+            if prefix and not path.stem.startswith(prefix):
+                continue
+            finished.append((path.stat().st_mtime, state, path))
+    finished.sort(key=lambda item: item[0], reverse=True)
+    tasks.extend(task_summary(path, state)
+                 for _mtime, state, path in finished[:max(0, recent)])
+    counts = {name: len(list(directory.glob("*.json")))
+              for name, directory in (("queued", INBOX), ("running", RUNNING),
+                                      ("done", DONE), ("failed", FAILED))}
+    return {"version": 1, "bus": str(BUS), "now": time.time(),
+            "counts": counts, "tasks": tasks}
+
+
 def cmd_submit(args: argparse.Namespace) -> int:
     ensure_bus()
     if args.prompt_file:
@@ -877,6 +967,9 @@ def cmd_submit(args: argparse.Namespace) -> int:
         "retry": args.retry,
         "continuations": args.continuations,
     }
+    origin = submit_origin()
+    if origin:
+        task["origin"] = origin
     if args.worktree:
         check = subprocess.run(["git", "-C", task["cwd"], "rev-parse", "--show-toplevel"],
                                capture_output=True, text=True)
@@ -959,6 +1052,10 @@ def cmd_run(args: argparse.Namespace) -> int:
 
 def cmd_status(args: argparse.Namespace) -> int:
     ensure_bus()
+    if args.json:
+        json.dump(status_snapshot(args.prefix, args.recent), sys.stdout)
+        sys.stdout.write("\n")
+        return 0
     for label, directory in [("inbox", INBOX), ("running", RUNNING),
                              ("done", DONE), ("failed", FAILED)]:
         if args.prefix:
@@ -1093,6 +1190,54 @@ def cmd_wait(args: argparse.Namespace) -> int:
         time.sleep(args.poll)
 
 
+def _mark_cancelled(path: Path, note: str) -> None:
+    try:
+        task = load_task(path)
+        task["cancelled"] = True
+        task["failure_note"] = note
+        path.write_text(json.dumps(task, indent=2) + "\n", encoding="utf-8")
+        (path.parent / f"{path.stem}.note.txt").write_text(note, encoding="utf-8")
+    except Exception:
+        pass
+
+
+def cmd_cancel(args: argparse.Namespace) -> int:
+    """Stop one task: a queued one moves straight to failed/, a running one's
+    dispatcher gets SIGTERM, which kills the worker's process group and
+    records the failure; either way the task is marked cancelled."""
+    ensure_bus()
+    note = "cancelled by `agent-dispatch cancel`"
+    queued = INBOX / f"{args.id}.json"
+    if queued.exists():
+        target = FAILED / queued.name
+        queued.rename(target)
+        _mark_cancelled(target, note)
+        print(f"cancelled: {args.id} (was queued)")
+        return 0
+    running = RUNNING / f"{args.id}.json"
+    if not running.exists():
+        print(f"No queued or running task {args.id}", file=sys.stderr)
+        return 1
+    pid = load_task(running).get("pid")
+    if not pid or not _pid_is_dispatcher(pid):
+        sweep_orphans(args.id)
+        _mark_cancelled(FAILED / running.name, note)
+        print(f"cancelled: {args.id} (dispatcher was already gone)")
+        return 0
+    os.kill(int(pid), signal.SIGTERM)
+    deadline = time.time() + args.wait
+    failed = FAILED / running.name
+    while time.time() < deadline and not failed.exists():
+        time.sleep(0.2)
+    if not failed.exists():
+        print(f"signalled dispatcher {pid}; {args.id} has not stopped yet",
+              file=sys.stderr)
+        return 1
+    _mark_cancelled(failed, note)
+    print(f"cancelled: {args.id}")
+    return 0
+
+
 def cmd_workers(_args: argparse.Namespace) -> int:
     """Show which worker CLIs are installed and usable. For setup checks."""
     for name in sorted(AGENT_COMMANDS):
@@ -1157,7 +1302,17 @@ def main() -> int:
 
     status = sub.add_parser("status", help="Show queue counts.")
     status.add_argument("--prefix")
+    status.add_argument("--json", action="store_true",
+                        help="Print queued, running and recent tasks as JSON.")
+    status.add_argument("--recent", type=int, default=20,
+                        help="With --json, how many finished tasks to include.")
     status.set_defaults(func=cmd_status)
+
+    cancel = sub.add_parser("cancel", help="Stop a queued or running task.")
+    cancel.add_argument("id")
+    cancel.add_argument("--wait", type=float, default=15.0,
+                        help="Seconds to wait for a running task to stop.")
+    cancel.set_defaults(func=cmd_cancel)
 
     list_cmd = sub.add_parser("list", help="List tasks in a queue.")
     list_cmd.add_argument("queue",

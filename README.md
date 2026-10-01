@@ -99,8 +99,16 @@ agent-dispatch submit --to cursor --mode write --cwd <project> \
 
 # Inspect queues
 agent-dispatch status
+agent-dispatch status --json   # queued, running and recent tasks; what the Claude Code pane reads
 agent-dispatch list done
+
+# Stop a queued or running task
+agent-dispatch cancel <id>
 ```
+
+`submit` records the submitting session in the task's `origin` (from
+`AGENT_BUS_ORIGIN`, else `CLAUDE_CODE_SESSION_ID`), so the Claude Code pane
+can report a completion back to the session that asked for it.
 
 `submit --bg` starts a detached dispatcher, prints its task ID, and appends
 dispatcher output to `logs/<id>.dispatcher.log`. `--worktree` creates a branch
@@ -154,6 +162,24 @@ instruct workers not to edit. Routes inherit the selected worker's behavior.
 - Fan-out: submit N tasks with a shared `--id` prefix (e.g. `batch-1`,
   `batch-2`), then `agent-dispatch wait --prefix batch-`.
 
+## Claude Code pane
+
+`plugin/` is a Claude Code mod that puts the bus beside the transcript:
+`/bus` toggles a pane of queued, running and recent tasks with their results
+(cancel a running one, or attach a finished result to the next prompt), the
+status line counts what runs, and a task a session dispatched toasts and
+reports back to that session when it finishes. It needs Claude Code 2.1.287
+or later. In a Claude Code session:
+
+```
+/plugin marketplace add Noah-Airmet/agent-bus
+/plugin install agent-bus@agent-bus
+/reload-plugins
+```
+
+From a local checkout, `/plugin marketplace add ~/.agent-bus-repo` works the
+same way. `plugin/README.md` covers what it hooks and how to develop it.
+
 ## Troubleshooting
 
 | Symptom | Likely cause | Fix |
@@ -171,6 +197,8 @@ instruct workers not to edit. Routes inherit the selected worker's behavior.
 rm -f ~/.local/bin/agent-dispatch
 rm -rf ~/.agent-bus ~/.agent-bus-repo
 ```
+
+In Claude Code, `/plugin uninstall agent-bus@agent-bus` removes the pane.
 
 (Also remove the bus section from the instruction file if you added one.)
 
