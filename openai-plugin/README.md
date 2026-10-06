@@ -52,28 +52,28 @@ public forwarding tunnel. Host/Origin checks are not user authentication.
 2. Install the official `tunnel-client` binary from the download link there.
    Its control-plane runtime API key is separate from model inference and is
    required by OpenAI's tunnel transport.
-3. Start the adapter:
-
-   ```sh
-   agent-bus-mcp --transport streamable-http
-   ```
-
-   It listens at `http://127.0.0.1:8766/mcp` only. Configure a tunnel-client
-   HTTP profile with `--mcp-server-url http://127.0.0.1:8766/mcp`; use
-   `tunnel-client help quickstart` for the current profile options. Keep
-   runtime keys in a private file or secret manager, never in plugin files.
-   Run `tunnel-client doctor --profile <profile> --explain`, then
-   `tunnel-client run --profile <profile>`.
-4. In ChatGPT Settings → Security and login, enable Developer mode. In
-   Plugins → plus, choose **Tunnel** and select that tunnel. Name it
-   **Agent Bus**. Enable it from the composer in a new Chat conversation.
+3. Prefer a stdio tunnel profile with `--mcp-command /absolute/path/to/agent-bus-mcp`.
+   This avoids needing a separate HTTP adapter process. Keep the runtime key in
+   an ignored private `.env`; use `OPENAI_API_KEY`,
+   `CONTROL_PLANE_ORGANIZATION_ID`, and `AGENT_BUS_TUNNEL_ID`. The organization
+   must match the key's organization. `start-chatgpt-tunnel.sh` loads these values
+   and starts or reuses the managed runtime. Install the official client at
+   `.runtime/tunnel-client-v0.0.15/tunnel-client`, or set `TUNNEL_CLIENT_BIN`.
+4. In ChatGPT Plugins → Add → Create MCP App, choose **Tunnel**, enter its ID,
+   and name the connection **Agent Bus**. Choose **No authentication** for the
+   adapter: the private tunnel enforces access through the associated OpenAI
+   organization/workspace. Connect it, then choose **Try in chat**.
 5. Ask: “Use Agent Bus to show available workers and permitted projects.”
    Then try a small read-only task and verify its final result.
 
-The local stdio and HTTP flows are tested. The ChatGPT account connection is
-a separate step and must be verified in the actual **Chat** surface; do not
-treat successful Work-mode testing as evidence for Chat-mode availability.
-Developer-mode availability and approvals depend on the account/workspace.
+The local stdio and HTTP flows are tested. Regular **Chat** was also verified:
+`bus_info` succeeded, and a read-only Codex worker returned `BUS_CHATGPT_OK`
+with exit code 0 through ChatGPT. The tunnel runtime runs on the Mac Mini
+(moved from the iMac 2026-10-06) and must stay running. On the Mini the script
+reads its credentials from the 1Password item `agent-bus-openai-plugin`.
+The tunnel key is for transport; worker execution continues to use each CLI's
+existing login and usage allowance. Developer-mode availability and approvals
+may vary by account/workspace.
 
 References:
 - [ChatGPT Developer mode](https://developers.openai.com/api/docs/guides/developer-mode)
