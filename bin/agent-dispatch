@@ -230,6 +230,17 @@ def read_worker_rules() -> str:
     return text
 
 
+def op_secret(ref: str) -> str:
+    """Read a secret through 1Password's agent-op wrapper (the Mini), else ""."""
+    if not shutil.which("agent-op"):
+        return ""
+    try:
+        return subprocess.run(["agent-op", "read", ref], capture_output=True,
+                              text=True, timeout=20).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
 def worker_env() -> dict:
     env = dict(os.environ)
     env["PATH"] = worker_path(env.get("PATH", ""))
@@ -243,6 +254,10 @@ def worker_env() -> dict:
                 env["CLAUDE_CODE_OAUTH_TOKEN"] = token
         except OSError:
             pass
+    if "CLAUDE_CODE_OAUTH_TOKEN" not in env:
+        token = op_secret("op://Agents/claude-oauth-token/CLAUDE_CODE_OAUTH_TOKEN")
+        if token:
+            env["CLAUDE_CODE_OAUTH_TOKEN"] = token
     if "CURSOR_API_KEY" not in env:
         try:
             key = "".join((HOME / ".config" / "cursor" / "api-key").read_text().split())
@@ -289,7 +304,7 @@ def notify_finished(task_id: str, status: str, agent: str, elapsed: float) -> No
         try:
             topic = (HOME / ".config" / "agent-bus" / "ntfy-topic").read_text().strip()
         except OSError:
-            return
+            topic = op_secret("op://Agents/ntfy-bus-topic/NTFY_TOPIC")
     if not topic:
         return
     try:
