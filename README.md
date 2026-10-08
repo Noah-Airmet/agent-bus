@@ -138,13 +138,25 @@ only the task ID, outcome, worker, and elapsed time.
 
 ### Recommended models
 
-| Worker | Default | Worth knowing |
+## Noah's routing policy
+
+All code writing, features, fixes, refactors, tests, scripts and UI work must
+use **Sonnet 5.5 on High** or **Opus 5.5 on High**. Pin the Claude model and
+`--effort high` explicitly. OpenAI is allowed only for super simple one-step
+operations (CLI installs, setup of existing GitHub tools, routine docs) and
+computer use, never code writing or debugging. If the scope grows, hand it
+to Claude. Claude quota exhaustion means wait or report the block, never
+fallback to OpenAI, `--to auto`, `--to cheap`, or another model for code.
+Canonical policy: `~/development/agent-ops/docs/ROUTING.md`.
+
+| Worker | Model / effort | Use |
 |---|---|---|
-| Principal / reviewer | Opus 5.5 at high effort | Taste, planning, brainstorming and review |
-| Implementation | `gpt-6.1-sol` at medium effort | `--to codex --model gpt-6.1-sol --effort medium`; needs Codex CLI ≥ 0.159 |
-| Throughput | `gpt-6-luna` at high effort | Codex default; bulk and fan-out |
-| Fallback | Sonnet 5.5 at medium effort | `--to claude --effort medium`; shares the Claude Pro window |
-| Overflow | Cursor | Use when other lanes are unavailable or constrained |
+| Implementation | Sonnet 5.5 at High | `--to claude --model claude-sonnet-5-5 --effort high` |
+| Complex code / principal / reviewer | Opus 5.5 at High | `--to claude --model claude-opus-5-5 --effort high` |
+| OpenAI / Codex | Restricted operations only | Super simple one-step setup, routine docs and computer use; no code work |
+
+Installed worker choices and automatic dispatch defaults are capabilities,
+not authorization to route code outside this policy.
 
 ### Read-only behavior
 

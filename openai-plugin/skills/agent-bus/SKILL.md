@@ -5,6 +5,20 @@ description: Delegate work to the user's local Codex or Claude workers, inspect 
 
 Use Agent Bus tools when the user requests delegation or oversight of bus tasks.
 
+## Noah's routing policy
+
+All code writing, features, fixes, refactors, tests, scripts and UI work must
+use **Sonnet 5.5 on High** or **Opus 5.5 on High**. Pin the Claude model and
+`--effort high` explicitly. OpenAI is allowed only for super simple one-step
+operations (CLI installs, setup of existing GitHub tools, routine docs) and
+computer use, never code writing or debugging. If the scope grows, hand it
+to Claude. Claude quota exhaustion means wait or report the block, never
+fallback to OpenAI, `--to auto`, `--to cheap`, or another model for code.
+Canonical policy: `~/development/agent-ops/docs/ROUTING.md`.
+
+For code submissions, set the Claude worker, an explicit Sonnet 5.5 or Opus
+5.5 model, and High effort. Installed tool defaults do not override this rule.
+
 1. Call `bus_info` to check permitted project roots and worker readiness.
 2. Brief workers with the goal, relevant context, constraints, acceptance criteria,
    and output format. Workers do not inherit the conversation.

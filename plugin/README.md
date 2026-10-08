@@ -1,5 +1,17 @@
 # agent-bus (Claude Code mod)
 
+## Noah's routing policy
+
+All code writing, features, fixes, refactors, tests, scripts and UI work must
+use **Sonnet 5.5 on High** or **Opus 5.5 on High**. Pin the Claude model and
+`--effort high` explicitly. OpenAI is allowed only for super simple one-step
+operations (CLI installs, setup of existing GitHub tools, routine docs) and
+computer use, never code writing or debugging. If the scope grows, hand it
+to Claude. Claude quota exhaustion means wait or report the block, never
+fallback to OpenAI, `--to auto`, `--to cheap`, or another model for code.
+Canonical policy: `~/development/agent-ops/docs/ROUTING.md`.
+
+
 The agent bus beside the transcript. `/bus` opens a pane that lists the
 queued and running tasks, then the most recent finished ones, and shows the
 selected task below them. Each toggle leaves `Bus panel shown` or
@@ -13,7 +25,8 @@ if it was left open.
   renders the result file as Markdown, with **Ask** (`a`), which attaches that
   result to your next prompt once, the way `/diff`'s ask attaches hunks.
 - **New task** (`n`, docked): a form in the detail's place. Pick a lane
-  (luna, sol or sonnet, as agent-ops `ROUTING.md` names them), read-only or
+  (installed choices; code requires Sonnet 5.5 or Opus 5.5 at High, per
+  agent-ops `ROUTING.md`), read-only or
   may-edit, and a folder (the session's by default), then type the prompt;
   Enter dispatches it in the background under this session, selects it in
   the list, and its finish reports back here.
