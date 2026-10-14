@@ -1,16 +1,5 @@
 # agent-bus (Claude Code mod)
 
-## Noah's routing policy
-
-All code writing, features, fixes, refactors, tests, scripts and UI work must
-use **Sonnet 5.5 on High** or **Opus 5.5 on High**. Pin the Claude model and
-`--effort high` explicitly. OpenAI is allowed only for super simple one-step
-operations (CLI installs, setup of existing GitHub tools, routine docs) and
-computer use, never code writing or debugging. If the scope grows, hand it
-to Claude. Claude quota exhaustion means wait or report the block, never
-fallback to OpenAI, `--to auto`, `--to cheap`, or another model for code.
-Canonical policy: `~/development/agent-ops/docs/ROUTING.md`.
-
 
 The agent bus beside the transcript. `/bus` opens a pane that lists the
 queued and running tasks, then the most recent finished ones, and shows the

@@ -138,25 +138,11 @@ only the task ID, outcome, worker, and elapsed time.
 
 ### Recommended models
 
-## Noah's routing policy
-
-All code writing, features, fixes, refactors, tests, scripts and UI work must
-use **Sonnet 5.5 on High** or **Opus 5.5 on High**. Pin the Claude model and
-`--effort high` explicitly. OpenAI is allowed only for super simple one-step
-operations (CLI installs, setup of existing GitHub tools, routine docs) and
-computer use, never code writing or debugging. If the scope grows, hand it
-to Claude. Claude quota exhaustion means wait or report the block, never
-fallback to OpenAI, `--to auto`, `--to cheap`, or another model for code.
-Canonical policy: `~/development/agent-ops/docs/ROUTING.md`.
-
 | Worker | Model / effort | Use |
 |---|---|---|
-| Implementation | Sonnet 5.5 at High | `--to claude --model claude-sonnet-5-5 --effort high` |
-| Complex code / principal / reviewer | Opus 5.5 at High | `--to claude --model claude-opus-5-5 --effort high` |
-| OpenAI / Codex | Restricted operations only | Super simple one-step setup, routine docs and computer use; no code work |
-
-Installed worker choices and automatic dispatch defaults are capabilities,
-not authorization to route code outside this policy.
+| Claude example | Sonnet 5.5 at High | `--to claude --model claude-sonnet-5-5 --effort high` |
+| Claude example | Opus 5.5 at High | `--to claude --model claude-opus-5-5 --effort high` |
+| OpenAI / Codex | Choose model and effort for the task | Coding, research, writing, operations and computer use |
 
 ### Read-only behavior
 
