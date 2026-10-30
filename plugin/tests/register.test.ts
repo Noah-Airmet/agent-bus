@@ -392,7 +392,7 @@ describe('another machine', () => {
       on,
       machine =>
         machine === 'imac'
-          ? [{ ...RUNNING, id: 'hermes-digest' }]
+          ? [{ ...RUNNING, id: 'nightly-digest' }]
           : [RUNNING, FINISHED],
       ['mini'],
     )
